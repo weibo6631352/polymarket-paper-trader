@@ -173,7 +173,10 @@ def run_backtest(
         pnl = ending_cash - balance
         roi_pct = (pnl / balance) * 100 if balance > 0 else 0.0
 
-        stats = compute_stats(trades, account, positions_value=0.0)
+        stats = compute_stats(
+            trades, account, positions_value=0.0,
+            equity_curve=engine.db.get_equity_curve(),
+        )
 
         result = BacktestResult(
             strategy=strategy_name,

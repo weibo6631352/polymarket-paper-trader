@@ -17,6 +17,7 @@ def compute_stats(
     trades: list[Trade],
     account: Account,
     positions_value: float = 0.0,
+    equity_curve: list[float] | None = None,
 ) -> dict:
     """Compute all analytics metrics from trade history.
 
@@ -24,6 +25,11 @@ def compute_stats(
         trades: All trades (newest first from DB).
         account: Current account state.
         positions_value: Sum of current_value for open positions.
+        equity_curve: Optional mark-to-market equity snapshots over time.
+            When provided (>= 2 points), Sharpe and max-drawdown are computed
+            from the *equity curve* — the correct mark-to-market basis. Without
+            it, they fall back to a cruder trade cash-flow proxy that treats
+            opening a position as a loss and ignores open-position value.
 
     Returns:
         Dict with all metrics.
@@ -34,6 +40,13 @@ def compute_stats(
 
     # Reverse to chronological order for time-series calculations
     chronological = list(reversed(trades))
+
+    if equity_curve and len(equity_curve) >= 2:
+        sharpe = sharpe_ratio_from_equity(equity_curve)
+        max_dd = max_drawdown_from_equity(equity_curve)
+    else:
+        sharpe = sharpe_ratio(chronological, account.starting_balance)
+        max_dd = max_drawdown(chronological, account.starting_balance)
 
     return {
         "starting_balance": account.starting_balance,
@@ -46,11 +59,47 @@ def compute_stats(
         "buy_count": sum(1 for t in trades if t.side == "buy"),
         "sell_count": sum(1 for t in trades if t.side == "sell"),
         "win_rate": win_rate(trades),
-        "sharpe_ratio": sharpe_ratio(chronological, account.starting_balance),
-        "max_drawdown": max_drawdown(chronological, account.starting_balance),
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_dd,
         "total_fees": sum(t.fee for t in trades),
         "avg_trade_size": _avg_trade_size(trades),
     }
+
+
+def sharpe_ratio_from_equity(equity_curve: list[float]) -> float:
+    """Sharpe ratio computed from a mark-to-market equity curve.
+
+    Returns per-observation Sharpe (mean / std of period returns); risk-free
+    rate assumed 0.  Not annualized — sampling cadence is caller-defined.
+    """
+    if len(equity_curve) < 2:
+        return 0.0
+    returns = []
+    for prev, cur in zip(equity_curve, equity_curve[1:]):
+        if prev > 0:
+            returns.append((cur - prev) / prev)
+    if len(returns) < 2:
+        return 0.0
+    mean_ret = sum(returns) / len(returns)
+    variance = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
+    std_ret = math.sqrt(variance)
+    if std_ret == 0:
+        return 0.0
+    return mean_ret / std_ret
+
+
+def max_drawdown_from_equity(equity_curve: list[float]) -> float:
+    """Maximum peak-to-trough drawdown (fraction) of an equity curve."""
+    if not equity_curve:
+        return 0.0
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for equity in equity_curve:
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            max_dd = max(max_dd, (peak - equity) / peak)
+    return max_dd
 
 
 def win_rate(trades: list[Trade]) -> float:

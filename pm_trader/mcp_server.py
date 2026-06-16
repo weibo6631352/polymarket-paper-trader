@@ -449,7 +449,7 @@ def stats(account: str = "default") -> str:
         portfolio_items = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio_items)
 
-        result = compute_stats(trades, acct, positions_value)
+        result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
         return _ok(result)
     except Exception as e:
         return _err_from(e)
@@ -473,7 +473,7 @@ def stats_card(account: str = "default", format: str = "markdown") -> str:
         portfolio_items = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio_items)
 
-        result = compute_stats(trades, acct, positions_value)
+        result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
         if format == "tweet":
             card = generate_tweet(result, account, portfolio_items)
         elif format == "plain":
@@ -501,7 +501,7 @@ def leaderboard_entry(account: str = "default") -> str:
         trades = engine.db.get_trades(limit=10_000)
         portfolio_items = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio_items)
-        result = compute_stats(trades, acct, positions_value)
+        result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
 
         first_trade = trades[-1].created_at if trades else None
         last_trade = trades[0].created_at if trades else None
@@ -555,7 +555,7 @@ def share_content(
         trades = engine.db.get_trades(limit=10_000)
         portfolio_items = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio_items)
-        result = compute_stats(trades, acct, positions_value)
+        result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
 
         if template == "milestone":
             card = generate_milestone_tweet(result)
@@ -591,7 +591,7 @@ def pk_card(account_a: str = "default", account_b: str = "aggressive") -> str:
             trades = engine.db.get_trades(limit=10_000)
             portfolio_items = engine.get_portfolio()
             positions_value = sum(p["current_value"] for p in portfolio_items)
-            results[name] = compute_stats(trades, acct, positions_value)
+            results[name] = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
 
         card = generate_pk_card(
             results[account_a], account_a,
@@ -642,7 +642,7 @@ def leaderboard_card(accounts: str = "") -> str:
                 trades = engine.db.get_trades(limit=10_000)
                 portfolio_items = engine.get_portfolio()
                 positions_value = sum(p["current_value"] for p in portfolio_items)
-                result = compute_stats(trades, acct, positions_value)
+                result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
                 result["account"] = name
                 entries.append(result)
             except Exception:

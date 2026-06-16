@@ -68,7 +68,10 @@ class Engine:
     # ------------------------------------------------------------------
 
     def init_account(self, balance: float = 10_000.0) -> Account:
-        return self.db.init_account(balance)
+        account = self.db.init_account(balance)
+        # Seed the equity curve with the starting (flat) equity.
+        self._record_equity()
+        return account
 
     def get_account(self) -> Account:
         account = self.db.get_account()
@@ -183,6 +186,11 @@ class Engine:
             avg_fill_price=fill.avg_price,
         )
 
+        mid = self._book_mid(book)
+        self._record_equity(
+            (market.condition_id, outcome, mid if mid else fill.avg_price)
+        )
+
         updated_account = self.get_account()
         return TradeResult(trade=trade, account=updated_account)
 
@@ -295,6 +303,11 @@ class Engine:
             proceeds=net_proceeds,
         )
 
+        mid = self._book_mid(book)
+        self._record_equity(
+            (market.condition_id, outcome, mid if mid else fill.avg_price)
+        )
+
         updated_account = self.get_account()
         return TradeResult(trade=trade, account=updated_account)
 
@@ -383,6 +396,64 @@ class Engine:
             "total_value": account.cash + positions_value,
             "pnl": (account.cash + positions_value) - account.starting_balance,
         }
+
+    # ------------------------------------------------------------------
+    # Equity curve (mark-to-market over time)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _book_mid(book) -> float | None:
+        """Midpoint of an order book snapshot, or None if one side is empty."""
+        if not book.bids or not book.asks:
+            return None
+        return (max(l.price for l in book.bids)
+                + min(l.price for l in book.asks)) / 2.0
+
+    def _record_equity(self, mark: tuple[str, str, float] | None = None) -> None:
+        """Append a mark-to-market equity snapshot. Best-effort, API-free.
+
+        Open positions are valued at *mark* (condition_id, outcome, price) for
+        the just-traded leg, and at cost basis (avg_entry_price) otherwise, so
+        this never issues a network call from the hot trade path.  Use
+        :meth:`snapshot_equity` for a fully live mark-to-market sample.
+        """
+        try:
+            account = self.db.get_account()
+            if account is None:
+                return
+            equity = account.cash
+            for pos in self.db.get_open_positions():
+                if (mark is not None
+                        and pos.market_condition_id == mark[0]
+                        and pos.outcome == mark[1]):
+                    price = mark[2]
+                else:
+                    price = pos.avg_entry_price
+                equity += pos.shares * price
+            self.db.record_equity(equity)
+        except Exception:
+            pass  # never let bookkeeping break a trade
+
+    def snapshot_equity(self) -> float:
+        """Record and return a fully live mark-to-market equity snapshot.
+
+        Values every open position at its current order-book midpoint (falling
+        back to cost basis if a price is unavailable).  Call periodically to
+        build a credible equity curve for Sharpe / drawdown analytics.
+        """
+        account = self._require_account()
+        equity = account.cash
+        for pos in self.db.get_open_positions():
+            try:
+                token_id = self._get_token_id_for_position(pos)
+                price = self.api.get_midpoint(token_id)
+            except Exception:
+                price = 0.0
+            if not price or price <= 0:
+                price = pos.avg_entry_price
+            equity += pos.shares * price
+        self.db.record_equity(equity)
+        return equity
 
     # ------------------------------------------------------------------
     # Trade history
@@ -557,6 +628,7 @@ class Engine:
             cost=fill.total_cost + fill.fee,
             avg_fill_price=fill.avg_price,
         )
+        self._record_equity((market.condition_id, order.outcome, fill.avg_price))
 
     def _execute_limit_sell(self, market, order, fill, fee_rate_bps: int) -> None:
         """Record a limit sell fill using a pre-computed FillResult."""
@@ -593,6 +665,7 @@ class Engine:
             sold_shares=fill.total_shares,
             proceeds=net_proceeds,
         )
+        self._record_equity((market.condition_id, order.outcome, fill.avg_price))
 
     def watch_prices(
         self, slugs_or_ids: list[str], outcomes: list[str] | None = None,
@@ -670,6 +743,7 @@ class Engine:
                 account=account,
             ))
 
+        self._record_equity()
         return results
 
     def resolve_all(self) -> list[ResolveResult]:

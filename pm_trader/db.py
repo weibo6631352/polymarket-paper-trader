@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS market_cache (
     data TEXT NOT NULL,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS equity_curve (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    equity REAL NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -98,13 +104,34 @@ class Database:
     # ------------------------------------------------------------------
 
     def init_account(self, balance: float = 10000.0) -> Account:
-        """Initialize the paper trading account. Returns the Account."""
+        """Initialize a clean paper trading account. Returns the Account.
+
+        Initialization is a full reset of trading state: any prior trades,
+        positions, and equity history are cleared so the account truly
+        starts flat at ``balance`` cash.  Without this, re-running init on an
+        existing account would reset cash while leaving stale positions —
+        producing a phantom P&L (cash restored *plus* the old holdings).
+        Cached market metadata is preserved.
+        """
         self.conn.execute(
             "INSERT OR REPLACE INTO account (id, starting_balance, cash) VALUES (1, ?, ?)",
             (balance, balance),
         )
+        self.conn.execute("DELETE FROM trades")
+        self.conn.execute("DELETE FROM positions")
+        self.conn.execute("DELETE FROM equity_curve")
+        # limit_orders is created lazily by orders.init_orders_schema; clear if present
+        if self._table_exists("limit_orders"):
+            self.conn.execute("DELETE FROM limit_orders")
         self.conn.commit()
         return self.get_account()
+
+    def _table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
 
     def get_account(self) -> Account | None:
         """Return the account, or None if not initialized."""
@@ -136,9 +163,28 @@ class Database:
             DROP TABLE IF EXISTS account;
             DROP TABLE IF EXISTS market_cache;
             DROP TABLE IF EXISTS limit_orders;
+            DROP TABLE IF EXISTS equity_curve;
             """
         )
         self.init_schema()
+
+    # ------------------------------------------------------------------
+    # Equity curve (mark-to-market snapshots over time)
+    # ------------------------------------------------------------------
+
+    def record_equity(self, equity: float) -> None:
+        """Append a mark-to-market equity snapshot to the curve."""
+        self.conn.execute(
+            "INSERT INTO equity_curve (equity) VALUES (?)", (equity,)
+        )
+        self.conn.commit()
+
+    def get_equity_curve(self) -> list[float]:
+        """Return all recorded equity snapshots in chronological order."""
+        rows = self.conn.execute(
+            "SELECT equity FROM equity_curve ORDER BY id"
+        ).fetchall()
+        return [row["equity"] for row in rows]
 
     # ------------------------------------------------------------------
     # Trades
