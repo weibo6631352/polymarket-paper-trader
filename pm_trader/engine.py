@@ -830,16 +830,36 @@ class Engine:
         """Advance every active maker quote: accrue rewards, apply adverse bleed.
 
         The agent-callable poll (call it periodically, like ``check_orders``).
-        For each active quote this fetches the live book + mid, accrues a share
-        of the pool's daily rate for the elapsed in-band time, and — if the mid
-        moved past the quoted offset since the last poll — charges the
-        adverse-selection bleed of the stale side being picked off.  Net cash
+        For each active quote this first RECONCILES the pool against the live
+        rewards program: if the market has left the program (no reward config) or
+        its daily rate has dropped to 0 — or it has resolved — the quote is
+        auto-cancelled and its reserved capital freed, so dead capital rotates
+        out instead of accruing phantom reward.  Otherwise it fetches the live
+        book + mid and accrues a share of the pool's CURRENT daily rate (not the
+        stale rate captured at placement) for the elapsed in-band time, minus the
+        adverse-selection bleed if the mid jumped the quoted offset.  Net cash
         impact per quote = reward − bleed; reserved capital is untouched.
         """
         self._require_account()
         now_dt = _utcnow(now)
         results: list[dict] = []
         for quote in get_active_maker_quotes(self.db.conn):
+            # Reconcile: is this pool still paying rewards?
+            try:
+                pool = self.api.get_reward_config(quote.market_condition_id)
+            except Exception:
+                continue  # transient API/network error — retry next poll
+            daily_rate = pool["daily"] if pool else 0.0
+            if pool is None or daily_rate <= 0:
+                # rewards ended / market resolved → cancel, free capital, stop
+                account = self.get_account()
+                self.db.update_cash(account.cash + quote.committed_capital)
+                cancelled = _cancel_maker_quote(self.db.conn, quote.id)
+                results.append({
+                    "quote": _maker_quote_to_dict(cancelled),
+                    "reconciled": "rewards_ended",
+                })
+                continue
             try:
                 book = self.api.get_order_book(quote.token_id)
                 mid = self.api.get_midpoint(quote.token_id)
@@ -855,7 +875,7 @@ class Engine:
             share = maker_reward_share(
                 quote.size, quote.half_spread_c, quote.max_spread_c, existing_qmin
             )
-            reward = reward_accrual(share, quote.daily_rate, seconds)
+            reward = reward_accrual(share, daily_rate, seconds)
             bleed = adverse_bleed(
                 quote.size, quote.half_spread_c, quote.last_mid, mid
             )

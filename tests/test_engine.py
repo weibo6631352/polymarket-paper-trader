@@ -1047,6 +1047,46 @@ class TestAccrueMakerRewards:
         results = eng.accrue_maker_rewards(now=T0 - timedelta(days=1))
         assert results[0]["reward"] == 0.0
 
+    def test_reconcile_cancels_when_rewards_end(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        assert eng.get_account().cash == pytest.approx(9951.0)  # 49 committed
+        # pool leaves the rewards program (or market resolved)
+        eng.api.get_reward_config = MagicMock(return_value=None)
+        results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        assert results[0]["reconciled"] == "rewards_ended"
+        assert results[0]["quote"]["status"] == "cancelled"
+        assert eng.get_account().cash == pytest.approx(10_000.0)  # capital freed
+        assert eng.get_maker_quotes() == []                      # no active quotes
+
+    def test_reconcile_cancels_when_daily_zero(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.api.get_reward_config = MagicMock(return_value={**MAKER_POOL, "daily": 0.0})
+        results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        assert results[0]["reconciled"] == "rewards_ended"
+        assert eng.get_account().cash == pytest.approx(10_000.0)
+
+    def test_accrual_uses_fresh_daily_rate(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)  # placed at daily 100, out-of-band book → share 1.0
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        # PM doubles the pool's daily rate after placement
+        eng.api.get_reward_config = MagicMock(return_value={**MAKER_POOL, "daily": 200.0})
+        results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        assert results[0]["reward"] == pytest.approx(200.0)  # fresh rate, not stale 100
+
+    def test_reward_config_error_skipped(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.api.get_reward_config = MagicMock(side_effect=Exception("down"))
+        assert eng.accrue_maker_rewards(now=T0 + timedelta(days=1)) == []
+        assert eng.get_account().cash == pytest.approx(9951.0)  # untouched, not cancelled
+        assert len(eng.get_maker_quotes()) == 1                 # still active
+
 
 class TestMakerSummaryAndBalance:
     def test_summary_aggregates(self, initialized_engine: Engine):
