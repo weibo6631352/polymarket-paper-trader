@@ -200,6 +200,7 @@ def _create_maker(conn, **overrides):
         min_size=50.0,
         daily_rate=100.0,
         tick=0.01,
+        cancel_efficiency=0.0,
         committed_capital=49.0,
         last_mid=0.50,
         last_accrued_at="2026-06-24T00:00:00+00:00",
@@ -218,6 +219,11 @@ class TestCreateMakerQuote:
         assert q.realized_bleed == 0.0
         assert q.fills == 0
         assert q.daily_rate == 100.0
+        assert q.cancel_efficiency == 0.0
+
+    def test_stores_cancel_efficiency(self, conn):
+        q = _create_maker(conn, cancel_efficiency=0.9)
+        assert q.cancel_efficiency == pytest.approx(0.9)
         assert q.committed_capital == pytest.approx(49.0)
         assert q.last_mid == pytest.approx(0.50)
         assert q.created_at is not None
@@ -263,6 +269,60 @@ class TestCancelMakerQuote:
         q = _create_maker(conn)
         cancel_maker_quote(conn, q.id)
         assert cancel_maker_quote(conn, q.id) is None
+
+
+class TestMakerQuotesMigration:
+    def test_backfills_cancel_efficiency_column(self):
+        # Simulate a DB created by the earlier schema (no cancel_efficiency).
+        c = sqlite3.connect(":memory:")
+        c.row_factory = sqlite3.Row
+        c.executescript(
+            """
+            CREATE TABLE maker_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_slug TEXT NOT NULL,
+                market_condition_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                size REAL NOT NULL,
+                half_spread_c REAL NOT NULL,
+                max_spread_c REAL NOT NULL,
+                min_size REAL NOT NULL,
+                daily_rate REAL NOT NULL,
+                tick REAL NOT NULL,
+                committed_capital REAL NOT NULL,
+                accrued_rewards REAL NOT NULL DEFAULT 0,
+                realized_bleed REAL NOT NULL DEFAULT 0,
+                fills INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                last_mid REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accrued_at TEXT NOT NULL
+            );
+            INSERT INTO maker_quotes (
+                market_slug, market_condition_id, outcome, token_id, size,
+                half_spread_c, max_spread_c, min_size, daily_rate, tick,
+                committed_capital, last_mid, last_accrued_at
+            ) VALUES ('m', '0x1', 'yes', 'tok', 50, 1, 4, 50, 100, 0.01,
+                      49, 0.5, '2026-06-24T00:00:00+00:00');
+            """
+        )
+        cols = {r[1] for r in c.execute("PRAGMA table_info(maker_quotes)").fetchall()}
+        assert "cancel_efficiency" not in cols
+        c.execute("UPDATE maker_quotes SET realized_bleed = 3.0")  # old-model bleed
+
+        init_orders_schema(c)  # runs the migration
+
+        # columns added, existing row reads back with defaults
+        q = get_maker_quote(c, 1)
+        assert q.cancel_efficiency == 0.0
+        assert q.max_inventory == 0.0
+        assert q.skew_strength == 0.0
+        assert q.inventory == 0.0
+        # entry_mid backfilled from last_mid so the drift-exit has a real anchor
+        assert q.entry_mid == pytest.approx(0.5)
+        # old realized_bleed carried over as negative inventory P&L (continuity)
+        assert q.inventory_pnl == pytest.approx(-3.0)
 
 
 class TestUpdateMakerQuoteAccrual:

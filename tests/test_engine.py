@@ -860,7 +860,8 @@ OUT_OF_BAND_BOOK = _make_book(bids=[(0.40, 1000)], asks=[(0.60, 1000)])
 CONTESTED_BOOK = _make_book(bids=[(0.49, 100)], asks=[(0.51, 100)])
 
 
-def _mock_maker_api(engine, market=None, pool="default", book=None, mid=0.50):
+def _mock_maker_api(engine, market=None, pool="default", book=None, mid=0.50,
+                    history=None):
     """Patch the API surface used by maker-quote methods."""
     m = market or SAMPLE_MARKET
     engine.api.get_market = MagicMock(return_value=m)
@@ -870,6 +871,7 @@ def _mock_maker_api(engine, market=None, pool="default", book=None, mid=0.50):
         return_value=book if book is not None else OUT_OF_BAND_BOOK
     )
     engine.api.get_midpoint = MagicMock(return_value=mid)
+    engine.api.prices_history = MagicMock(return_value=history or [])
 
 
 class TestPlaceMakerQuote:
@@ -895,6 +897,53 @@ class TestPlaceMakerQuote:
         assert q["size"] == 100.0
         assert q["half_spread_c"] == pytest.approx(2.0)
         assert q["committed_capital"] == pytest.approx(100.0 * (1 - 0.04))
+
+    def test_cancel_efficiency_stored(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes", cancel_efficiency=0.9, now=T0
+        )
+        assert q["cancel_efficiency"] == pytest.approx(0.9)
+
+    def test_cancel_efficiency_out_of_range_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote(
+                "will-bitcoin-hit-100k", "yes", cancel_efficiency=1.5
+            )
+
+    def test_inventory_params_stored(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes",
+            max_inventory=120.0, skew_strength=2.0, now=T0,
+        )
+        assert q["max_inventory"] == pytest.approx(120.0)
+        assert q["skew_strength"] == pytest.approx(2.0)
+        assert q["entry_mid"] == pytest.approx(0.50)
+        assert q["inventory"] == 0.0
+
+    def test_default_inventory_cap(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        assert q["max_inventory"] == pytest.approx(4.0 * 50.0)  # 4 x size default
+        assert q["skew_strength"] == pytest.approx(1.0)
+
+    def test_negative_skew_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "yes", skew_strength=-1.0)
+
+    def test_nonpositive_max_inventory_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "yes", max_inventory=-5.0)
 
     def test_size_below_min_rejected(self, initialized_engine: Engine):
         eng = initialized_engine
@@ -989,13 +1038,14 @@ class TestCancelMakerQuote:
 class TestAccrueMakerRewards:
     def test_empty_band_full_day_reward(self, initialized_engine: Engine):
         eng = initialized_engine
-        _mock_maker_api(eng)  # out-of-band book → share 1.0
+        _mock_maker_api(eng)  # out-of-band book → share 1.0, mid steady → no fill
         eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
         results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
         assert len(results) == 1
         assert results[0]["share"] == pytest.approx(1.0)
         assert results[0]["reward"] == pytest.approx(100.0)
-        assert results[0]["bleed"] == 0.0
+        assert results[0]["fill_loss"] == 0.0
+        assert results[0]["inventory"] == 0.0
         # cash = 10000 - 49 committed + 100 reward
         assert eng.get_account().cash == pytest.approx(10_051.0)
 
@@ -1008,32 +1058,108 @@ class TestAccrueMakerRewards:
         assert results[0]["share"] == pytest.approx(1.0 / 3.0)
         assert results[0]["reward"] == pytest.approx(100.0 / 3.0)
 
-    def test_adverse_bleed_within_band(self, initialized_engine: Engine):
+    def test_within_band_fills_and_accumulates_inventory(self, initialized_engine: Engine):
         eng = initialized_engine
         _mock_maker_api(eng)
         eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
-        # mid moves 3c (inside the 4c band) → bleed but keep quoting, no jump-exit
+        # mid drops 3c (inside the 4c band) → our bid (0.49) is hit → we buy 50,
+        # accumulating LONG inventory; quote keeps running (no drift-exit).
         eng.api.get_midpoint.return_value = 0.47
         results = eng.accrue_maker_rewards(now=T0)
         assert results[0]["reward"] == 0.0
-        assert results[0]["bleed"] == pytest.approx(1.0)  # 50 * (0.03 - 0.01)
+        assert results[0]["fill_loss"] == pytest.approx(1.0)   # 50 * (0.49 - 0.47)
+        assert results[0]["inventory"] == pytest.approx(50.0)  # bought, now long
+        assert results[0]["inventory_pnl_delta"] == pytest.approx(-1.0)
         assert results[0]["quote"]["fills"] == 1
-        assert results[0]["quote"]["status"] == "active"      # still quoting
+        assert results[0]["quote"]["status"] == "active"       # still quoting
         assert eng.get_account().cash == pytest.approx(9951.0 - 1.0)
 
-    def test_catalyst_jump_exits(self, initialized_engine: Engine):
+    def test_catalyst_drift_exits(self, initialized_engine: Engine):
         eng = initialized_engine
         _mock_maker_api(eng)
         eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
-        # mid jumps 5c — beyond the 4c band → take the hit, then exit (cancel)
+        # mid moves 5c from entry — beyond the 4c band → flatten + exit (cancel)
         eng.api.get_midpoint.return_value = 0.45
         results = eng.accrue_maker_rewards(now=T0)
-        assert results[0]["reconciled"] == "jump_exit"
-        assert results[0]["bleed"] == pytest.approx(2.0)      # 50 * (0.05 - 0.01)
+        assert results[0]["reconciled"] == "drift_exit"
+        assert results[0]["fill_loss"] == pytest.approx(2.0)   # 50 * (0.49 - 0.45)
         assert results[0]["quote"]["status"] == "cancelled"
-        assert eng.get_maker_quotes() == []                   # exited
-        # capital freed (49) minus the one bleed (2): 9951 + 49 - 2
+        assert results[0]["quote"]["inventory"] == 0.0         # flattened on exit
+        assert eng.get_maker_quotes() == []                    # exited
+        # capital freed (49) minus the one pick-off (2): 9951 + 49 - 2
         assert eng.get_account().cash == pytest.approx(9998.0)
+
+    def test_cancel_efficiency_reduces_fill_loss(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes", cancel_efficiency=0.75, now=T0
+        )
+        eng.api.get_midpoint.return_value = 0.45  # 5c move → drift-exit
+        results = eng.accrue_maker_rewards(now=T0)
+        # fill size 50*(1-0.75)=12.5 → loss 12.5*(0.49-0.45)=0.5
+        assert results[0]["fill_loss"] == pytest.approx(0.5)
+
+    def test_uptrend_accumulates_short_then_drift_exits(self, initialized_engine: Engine):
+        # The user's scenario: a persistent uptrend lifts our ask repeatedly →
+        # we accumulate a losing SHORT; held-MTM + pick-off drag inventory_pnl
+        # negative; once the mid drifts a full band from entry we flatten + exit.
+        eng = initialized_engine
+        # skew off + big cap so we can watch raw accumulation across polls
+        _mock_maker_api(eng)
+        eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes",
+            max_inventory=1000.0, skew_strength=0.0, now=T0,
+        )
+        mids = [0.51, 0.52, 0.53]  # +1c per poll, within the 4c band (no exit yet)
+        for i, m in enumerate(mids, start=1):
+            eng.api.get_midpoint.return_value = m
+            res = eng.accrue_maker_rewards(now=T0 + timedelta(seconds=60 * i))
+            assert "reconciled" not in res[0]          # still quoting
+        # sold 50 each poll into the rise → short 150, inventory P&L negative
+        q = eng.get_maker_quotes()[0]
+        assert q["inventory"] == pytest.approx(-150.0)
+        assert q["inventory_pnl"] < 0
+        # now the mid clears a full band from entry (0.50 → 0.55) → drift-exit
+        eng.api.get_midpoint.return_value = 0.55
+        res = eng.accrue_maker_rewards(now=T0 + timedelta(seconds=300))
+        assert res[0]["reconciled"] == "drift_exit"
+        assert res[0]["quote"]["inventory"] == 0.0     # flattened
+        assert eng.get_maker_quotes() == []
+
+    def test_unset_cap_uses_default(self, initialized_engine: Engine):
+        # a migrated quote has max_inventory backfilled to 0 (unset) → accrue
+        # falls back to the default cap (4 x size) instead of clamping fills to 0
+        from pm_trader.orders import create_maker_quote
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        create_maker_quote(
+            eng.db.conn, market_slug="will-bitcoin-hit-100k",
+            market_condition_id="0xabc123", outcome="yes", token_id="tok_yes",
+            size=50.0, half_spread_c=1.0, max_spread_c=4.0, min_size=50.0,
+            daily_rate=100.0, tick=0.01, cancel_efficiency=0.0,
+            committed_capital=49.0, last_mid=0.50, last_accrued_at=T0.isoformat(),
+            max_inventory=0.0, skew_strength=0.0, entry_mid=0.0,  # both unset
+        )
+        eng.api.get_midpoint.return_value = 0.47  # bid hit → buy 50 (cap not 0)
+        res = eng.accrue_maker_rewards(now=T0)
+        assert res[0]["inventory"] == pytest.approx(50.0)  # default cap applied
+        assert "reconciled" not in res[0]  # entry_mid unset → re-anchored, no exit
+
+    def test_inventory_cap_caps_short(self, initialized_engine: Engine):
+        # at the position cap the quote goes one-sided: it stops adding short
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes",
+            max_inventory=80.0, skew_strength=0.0, now=T0,
+        )
+        # two up-polls would sell 50 each (=100) but cap is 80 → clamped at -80
+        for i, m in enumerate((0.515, 0.525), start=1):
+            eng.api.get_midpoint.return_value = m
+            eng.accrue_maker_rewards(now=T0 + timedelta(seconds=60 * i))
+        q = eng.get_maker_quotes()[0]
+        assert q["inventory"] == pytest.approx(-80.0)  # capped, not -100
 
     def test_transient_book_error_skipped(self, initialized_engine: Engine):
         eng = initialized_engine
@@ -1101,6 +1227,73 @@ class TestAccrueMakerRewards:
         assert eng.accrue_maker_rewards(now=T0 + timedelta(days=1)) == []
         assert eng.get_account().cash == pytest.approx(9951.0)  # untouched, not cancelled
         assert len(eng.get_maker_quotes()) == 1                 # still active
+
+
+class TestSuggestMakerHalfSpread:
+    def test_calm_pool_suggests_tightest(self, initialized_engine: Engine):
+        eng = initialized_engine
+        # flat history → sigma 0 → no bleed → tightest (1 tick = 1c) optimal
+        flat = [{"t": i * 60, "p": 0.50} for i in range(20)]
+        _mock_maker_api(eng, history=flat)
+        rec = eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
+        assert rec["half_spread_c"] == pytest.approx(1.0)  # tick_c
+        assert rec["sigma_c"] == 0.0
+        assert rec["bleed_per_day"] == 0.0
+
+    def test_volatile_pool_suggests_wider(self, initialized_engine: Engine):
+        eng = initialized_engine
+        # zig-zag history → positive sigma → optimal widens past the tick
+        vol = [{"t": i * 60, "p": 0.50 + (0.04 if i % 2 else 0.0)} for i in range(20)]
+        _mock_maker_api(eng, history=vol)
+        rec = eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
+        assert rec["sigma_c"] > 0
+        assert rec["half_spread_c"] > 1.0
+
+    def test_history_error_falls_back_to_zero_vol(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.api.prices_history = MagicMock(side_effect=Exception("down"))
+        rec = eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
+        assert rec["sigma_c"] == 0.0  # fell back, still produced a recommendation
+
+    def test_not_in_program_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng, pool=None)
+        with pytest.raises(OrderRejectedError):
+            eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
+
+    def test_invalid_mid_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng, mid=0.0)
+        with pytest.raises(OrderRejectedError):
+            eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
+
+    def test_cancel_efficiency_out_of_range_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.suggest_maker_half_spread(
+                "will-bitcoin-hit-100k", "yes", cancel_efficiency=2.0
+            )
+
+    def test_nonpositive_poll_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.suggest_maker_half_spread(
+                "will-bitcoin-hit-100k", "yes", poll_seconds=0.0
+            )
+
+    def test_invalid_outcome_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(InvalidOutcomeError):
+            eng.suggest_maker_half_spread("will-bitcoin-hit-100k", "maybe")
+
+    def test_requires_account(self, engine: Engine):
+        _mock_maker_api(engine)
+        with pytest.raises(NotInitializedError):
+            engine.suggest_maker_half_spread("will-bitcoin-hit-100k", "yes")
 
 
 class TestMakerSummaryAndBalance:

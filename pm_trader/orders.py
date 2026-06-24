@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS maker_quotes (
     min_size REAL NOT NULL,
     daily_rate REAL NOT NULL,
     tick REAL NOT NULL,
+    cancel_efficiency REAL NOT NULL DEFAULT 0,
+    max_inventory REAL NOT NULL DEFAULT 0,
+    skew_strength REAL NOT NULL DEFAULT 0,
+    inventory REAL NOT NULL DEFAULT 0,
+    inventory_pnl REAL NOT NULL DEFAULT 0,
+    entry_mid REAL NOT NULL DEFAULT 0,
     committed_capital REAL NOT NULL,
     accrued_rewards REAL NOT NULL DEFAULT 0,
     realized_bleed REAL NOT NULL DEFAULT 0,
@@ -95,6 +101,43 @@ CREATE TABLE IF NOT EXISTS maker_quotes (
 def init_orders_schema(conn: sqlite3.Connection) -> None:
     """Create the limit_orders and maker_quotes tables if they don't exist."""
     conn.executescript(ORDERS_SCHEMA)
+    _migrate_maker_quotes(conn)
+
+
+_MAKER_ADDED_COLUMNS = (
+    # column, DDL — added after the table first shipped; backfilled to keep
+    # databases created by an earlier schema readable (CREATE TABLE IF NOT
+    # EXISTS won't alter them).  All default to 0: cancel_efficiency 0 = the
+    # conservative always-picked-off case; max_inventory/skew_strength 0 = the
+    # legacy mark-to-market path (inventory mode off).
+    ("cancel_efficiency", "REAL NOT NULL DEFAULT 0"),
+    ("max_inventory", "REAL NOT NULL DEFAULT 0"),
+    ("skew_strength", "REAL NOT NULL DEFAULT 0"),
+    ("inventory", "REAL NOT NULL DEFAULT 0"),
+    ("inventory_pnl", "REAL NOT NULL DEFAULT 0"),
+    ("entry_mid", "REAL NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate_maker_quotes(conn: sqlite3.Connection) -> None:
+    """Additively migrate an existing maker_quotes table to the current schema."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(maker_quotes)").fetchall()}
+    added = set()
+    for name, ddl in _MAKER_ADDED_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE maker_quotes ADD COLUMN {name} {ddl}")
+            added.add(name)
+    if "entry_mid" in added:
+        # anchor pre-existing quotes at their last known mid so the drift-exit
+        # measures from a real reference (not the 0 default).
+        conn.execute("UPDATE maker_quotes SET entry_mid = last_mid")
+    if "inventory_pnl" in added:
+        # the old mark-to-market model's realized_bleed WAS the (negative)
+        # inventory P&L; carry it over so net_maker_pnl = reward + inventory_pnl
+        # stays continuous across the model change.
+        conn.execute("UPDATE maker_quotes SET inventory_pnl = -realized_bleed")
+    if added:
+        conn.commit()
 
 
 def create_order(
@@ -277,6 +320,12 @@ class MakerQuote:
     min_size: float
     daily_rate: float
     tick: float
+    cancel_efficiency: float
+    max_inventory: float
+    skew_strength: float
+    inventory: float
+    inventory_pnl: float
+    entry_mid: float
     committed_capital: float
     accrued_rewards: float
     realized_bleed: float
@@ -300,9 +349,13 @@ def create_maker_quote(
     min_size: float,
     daily_rate: float,
     tick: float,
+    cancel_efficiency: float,
     committed_capital: float,
     last_mid: float,
     last_accrued_at: str,
+    max_inventory: float = 0.0,
+    skew_strength: float = 0.0,
+    entry_mid: float = 0.0,
 ) -> MakerQuote:
     """Create a new active maker quote and return it."""
     cursor = conn.execute(
@@ -310,12 +363,14 @@ def create_maker_quote(
         INSERT INTO maker_quotes (
             market_slug, market_condition_id, outcome, token_id,
             size, half_spread_c, max_spread_c, min_size, daily_rate, tick,
+            cancel_efficiency, max_inventory, skew_strength, entry_mid,
             committed_capital, last_mid, last_accrued_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             market_slug, market_condition_id, outcome, token_id,
             size, half_spread_c, max_spread_c, min_size, daily_rate, tick,
+            cancel_efficiency, max_inventory, skew_strength, entry_mid,
             committed_capital, last_mid, last_accrued_at,
         ),
     )
@@ -364,8 +419,10 @@ def update_maker_quote_accrual(
     fills: int,
     last_mid: float,
     last_accrued_at: str,
+    inventory: float = 0.0,
+    inventory_pnl: float = 0.0,
 ) -> MakerQuote:
-    """Persist an accrual step's updated totals and bookkeeping timestamps."""
+    """Persist an accrual step's updated totals, inventory, and timestamps."""
     conn.execute(
         """\
         UPDATE maker_quotes SET
@@ -373,10 +430,13 @@ def update_maker_quote_accrual(
             realized_bleed = ?,
             fills = ?,
             last_mid = ?,
-            last_accrued_at = ?
+            last_accrued_at = ?,
+            inventory = ?,
+            inventory_pnl = ?
         WHERE id = ?
         """,
-        (accrued_rewards, realized_bleed, fills, last_mid, last_accrued_at, quote_id),
+        (accrued_rewards, realized_bleed, fills, last_mid, last_accrued_at,
+         inventory, inventory_pnl, quote_id),
     )
     conn.commit()
     return _get_maker_quote(conn, quote_id)
@@ -404,6 +464,12 @@ def _row_to_maker_quote(row: sqlite3.Row) -> MakerQuote:
         min_size=row["min_size"],
         daily_rate=row["daily_rate"],
         tick=row["tick"],
+        cancel_efficiency=row["cancel_efficiency"],
+        max_inventory=row["max_inventory"],
+        skew_strength=row["skew_strength"],
+        inventory=row["inventory"],
+        inventory_pnl=row["inventory_pnl"],
+        entry_mid=row["entry_mid"],
         committed_capital=row["committed_capital"],
         accrued_rewards=row["accrued_rewards"],
         realized_bleed=row["realized_bleed"],

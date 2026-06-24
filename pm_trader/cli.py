@@ -424,7 +424,7 @@ def stats(ctx: click.Context, card: bool, plain: bool, tweet: bool) -> None:
             trades, account, positions_value,
             equity_curve=engine.db.get_equity_curve(),
             reward_income=maker["reward_income"],
-            adverse_bleed=maker["adverse_bleed"],
+            inventory_pnl=maker["inventory_pnl"],
             committed_capital=maker["committed_capital"],
         )
         if tweet or card or plain:
@@ -868,16 +868,31 @@ def maker() -> None:
     "--half-spread", "half_spread_cents", type=float, default=None,
     help="Cents either side of mid (default one tick in-band).",
 )
+@click.option(
+    "--cancel-efficiency", type=float, default=0.0,
+    help="Colocation lever 0-1: fraction of adverse fills avoided by fast cancels.",
+)
+@click.option(
+    "--max-inventory", type=float, default=None,
+    help="Position cap in shares (default 4 x size). At the cap quoting goes one-sided.",
+)
+@click.option(
+    "--skew-strength", type=float, default=1.0,
+    help="Inventory-skew lean (offsets per size-unit of inventory); 0 = no skew.",
+)
 @click.pass_context
 def maker_place(
     ctx: click.Context, slug_or_id: str, outcome: str,
-    size: float | None, half_spread_cents: float | None,
+    size: float | None, half_spread_cents: float | None, cancel_efficiency: float,
+    max_inventory: float | None, skew_strength: float,
 ) -> None:
     """Place a two-sided maker quote: pm-trader maker place SLUG"""
     engine = _get_engine(ctx)
     try:
         result = engine.place_maker_quote(
             slug_or_id, outcome, size=size, half_spread_cents=half_spread_cents,
+            cancel_efficiency=cancel_efficiency,
+            max_inventory=max_inventory, skew_strength=skew_strength,
         )
         click.echo(_ok(result))
     except SimError as e:
@@ -932,6 +947,37 @@ def maker_accrue(ctx: click.Context) -> None:
     engine = _get_engine(ctx)
     try:
         click.echo(_ok(engine.accrue_maker_rewards()))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("suggest")
+@click.argument("slug_or_id")
+@click.option("--outcome", default="yes", help="Outcome to quote (default yes).")
+@click.option(
+    "--cancel-efficiency", type=float, default=0.0,
+    help="Colocation lever 0-1 used in the net-optimal offset search.",
+)
+@click.option(
+    "--poll-seconds", type=float, default=60.0,
+    help="Re-quote cadence assumed for the bleed model (default 60s).",
+)
+@click.pass_context
+def maker_suggest(
+    ctx: click.Context, slug_or_id: str, outcome: str,
+    cancel_efficiency: float, poll_seconds: float,
+) -> None:
+    """Recommend the net-optimal half-spread (vol-aware) for a reward pool."""
+    engine = _get_engine(ctx)
+    try:
+        result = engine.suggest_maker_half_spread(
+            slug_or_id, outcome,
+            cancel_efficiency=cancel_efficiency, poll_seconds=poll_seconds,
+        )
+        click.echo(_ok(result))
     except SimError as e:
         click.echo(_err(e))
         sys.exit(1)

@@ -20,7 +20,7 @@ def compute_stats(
     equity_curve: list[float] | None = None,
     *,
     reward_income: float = 0.0,
-    adverse_bleed: float = 0.0,
+    inventory_pnl: float = 0.0,
     committed_capital: float = 0.0,
 ) -> dict:
     """Compute all analytics metrics from trade history.
@@ -35,24 +35,25 @@ def compute_stats(
             it, they fall back to a cruder trade cash-flow proxy that treats
             opening a position as a loss and ignores open-position value.
         reward_income: Cumulative liquidity-rewards USDC accrued by maker quotes.
-        adverse_bleed: Cumulative adverse-selection loss from maker quotes.
+        inventory_pnl: Cumulative maker inventory P&L (held mark-to-market plus
+            adverse pick-off cost; usually ≤ 0 in a trend).
         committed_capital: Cash currently reserved behind active maker quotes
             (reserved out of ``account.cash`` but still owned, so added back into
             total value).
 
     Returns:
-        Dict with all metrics.  Maker reward income is reported separately from
-        trading P&L: the engine credits accrued rewards (and debits bleed) to
-        cash as they happen, so ``net_maker_pnl`` is carved back out of ``pnl``
-        to leave ``trading_pnl``.  Earlier the analytics had no reward concept
-        (reward rate implicitly 0); the real per-market accrual is wired through
-        here.
+        Dict with all metrics.  Maker P&L is reported separately from directional
+        trading P&L: the engine marks reward income and inventory P&L to cash as
+        they happen, so ``net_maker_pnl = reward_income + inventory_pnl`` is
+        carved back out of ``pnl`` to leave ``trading_pnl``.  Earlier the
+        analytics had no reward concept (reward rate implicitly 0); the real
+        per-market accrual is wired through here.
     """
     total_value = account.cash + positions_value + committed_capital
     pnl = total_value - account.starting_balance
     roi_pct = (pnl / account.starting_balance * 100) if account.starting_balance else 0.0
 
-    net_maker_pnl = reward_income - adverse_bleed
+    net_maker_pnl = reward_income + inventory_pnl
     trading_pnl = pnl - net_maker_pnl
 
     # Reverse to chronological order for time-series calculations
@@ -74,7 +75,7 @@ def compute_stats(
         "pnl": pnl,
         "trading_pnl": trading_pnl,
         "reward_income": reward_income,
-        "adverse_bleed": adverse_bleed,
+        "inventory_pnl": inventory_pnl,
         "net_maker_pnl": net_maker_pnl,
         "roi_pct": roi_pct,
         "total_trades": len(trades),

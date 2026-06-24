@@ -253,6 +253,21 @@ class PolymarketClient:
         self._set_cached(cache_key, {"minimum_tick_size": tick})
         return tick
 
+    def prices_history(
+        self, token_id: str, *, interval: str = "max", fidelity: int = 60
+    ) -> list[dict]:
+        """Fetch mid-price history points ``[{t, p}, ...]`` for a token.  Never cached.
+
+        Used to estimate a pool's recent volatility for optimal-quote sizing.
+        """
+        data = self._clob_get(
+            "/prices-history",
+            params={"market": token_id, "interval": interval, "fidelity": fidelity},
+        )
+        if isinstance(data, dict):
+            return data.get("history", []) or []
+        return []
+
     def get_reward_config(self, condition_id: str) -> dict | None:
         """Fetch a market's liquidity-reward config from the CLOB, or None.
 

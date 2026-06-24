@@ -942,3 +942,23 @@ class TestGetRewardConfig:
             json=[],
         )
         assert client.get_reward_config("0xabc123") is None
+
+
+# ---------------------------------------------------------------------------
+# prices_history tests
+# ---------------------------------------------------------------------------
+
+class TestPricesHistory:
+    def test_returns_history(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(json={"history": [{"t": 1, "p": 0.5}, {"t": 61, "p": 0.51}]})
+        h = client.prices_history("tok_yes")
+        assert h[0]["p"] == 0.5
+        assert h[1]["t"] == 61
+
+    def test_dict_without_history(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(json={"foo": 1})
+        assert client.prices_history("tok_yes") == []
+
+    def test_non_dict(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(json=[1, 2])
+        assert client.prices_history("tok_yes") == []

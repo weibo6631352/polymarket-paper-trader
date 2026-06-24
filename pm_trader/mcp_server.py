@@ -443,6 +443,9 @@ def place_maker_quote(
     outcome: str = "yes",
     size: float = 0.0,
     half_spread_cents: float = 0.0,
+    cancel_efficiency: float = 0.0,
+    max_inventory: float = 0.0,
+    skew_strength: float = 1.0,
     account: str = "default",
 ) -> str:
     """Place a resting two-sided maker quote that earns liquidity rewards.
@@ -454,6 +457,15 @@ def place_maker_quote(
     validated recipe).  The market must be in the liquidity-rewards program.
     Reserves ``committed_capital`` out of cash until cancelled.  Call
     ``accrue_maker_rewards`` periodically to bank rewards and apply adverse bleed.
+
+    Inventory management (verified essential against trends — an uncapped quote
+    in a persistent move accumulates a losing position):
+    - cancel_efficiency (0-1): colocation lever, fraction of adverse fills a fast
+      canceller avoids (scales fill size down).
+    - max_inventory (shares): position cap; at the cap quoting goes one-sided.
+      Pass 0 to default to 4 x size.
+    - skew_strength (>=0): inventory-skew lean so the book mean-reverts to flat.
+    accrue_maker_rewards drift-exits (flatten + cancel) if the mid leaves the band.
     """
     try:
         engine = _get_engine(account)
@@ -462,6 +474,9 @@ def place_maker_quote(
             outcome,
             size=size if size > 0 else None,
             half_spread_cents=half_spread_cents if half_spread_cents > 0 else None,
+            cancel_efficiency=cancel_efficiency,
+            max_inventory=max_inventory if max_inventory > 0 else None,
+            skew_strength=skew_strength,
         )
         return _ok(quote)
     except Exception as e:
@@ -509,6 +524,34 @@ def accrue_maker_rewards(account: str = "default") -> str:
 
 
 @mcp.tool()
+def suggest_maker_quote(
+    slug_or_id: str,
+    outcome: str = "yes",
+    cancel_efficiency: float = 0.0,
+    poll_seconds: float = 60.0,
+    account: str = "default",
+) -> str:
+    """Recommend the net-optimal half-spread (cents) for a liquidity-reward pool.
+
+    Pulls live pool config + book competition + recent volatility and grid-searches
+    the offset that maximises ``reward − adverse_bleed`` per day.  This adapts the
+    Avellaneda-Stoikov optimal-spread idea to PM's reward subsidy: quoting tighter
+    earns a quadratically larger reward share but bleeds more to adverse selection,
+    so there is an interior optimum that widens with volatility and tightens with a
+    higher cancel_efficiency (colocation) or finer poll cadence.  Use the returned
+    ``half_spread_c`` as the ``half_spread_cents`` for ``place_maker_quote``.
+    """
+    try:
+        engine = _get_engine(account)
+        return _ok(engine.suggest_maker_half_spread(
+            slug_or_id, outcome,
+            cancel_efficiency=cancel_efficiency, poll_seconds=poll_seconds,
+        ))
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
 def maker_status(account: str = "default") -> str:
     """Aggregate maker P&L: committed capital, reward income, bleed, net P&L."""
     try:
@@ -540,7 +583,7 @@ def stats(account: str = "default") -> str:
             trades, acct, positions_value,
             equity_curve=engine.db.get_equity_curve(),
             reward_income=maker["reward_income"],
-            adverse_bleed=maker["adverse_bleed"],
+            inventory_pnl=maker["inventory_pnl"],
             committed_capital=maker["committed_capital"],
         )
         return _ok(result)

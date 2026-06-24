@@ -44,16 +44,25 @@ from pm_trader.orders import (
     update_maker_quote_accrual,
 )
 from pm_trader.orderbook import (
-    adverse_bleed,
     book_inband_qmin,
     committed_capital,
+    maker_fill,
     maker_reward_share,
+    optimal_half_spread,
+    realized_sigma_c_from_history,
     reward_accrual,
     simulate_buy_fill,
     simulate_sell_fill,
 )
 
 MIN_ORDER_USD = 1.0  # Polymarket minimum order size
+
+# Maker-quote inventory defaults: a two-sided quote that accumulates inventory on
+# one-sided fills needs a position cap and an inventory skew, or a persistent
+# trend runs it over (verified: uncapped → −$1080 vs capped+skew+exit → −$3 on
+# the same uptrend).  See [[mm-principles-for-pm-rewards]].
+MAKER_CAP_MULT = 4.0       # default position cap = 4 × quote size (shares)
+MAKER_SKEW_STRENGTH = 1.0  # default inventory-skew lean (offsets per size-unit)
 
 # Errors that indicate an order is permanently unfillable (not transient)
 _PERMANENT_ORDER_ERRORS = (
@@ -419,7 +428,7 @@ class Engine:
             "positions_value": positions_value,
             "maker_committed_capital": committed,
             "maker_reward_income": maker["reward_income"],
-            "maker_adverse_bleed": maker["adverse_bleed"],
+            "maker_inventory_pnl": maker["inventory_pnl"],
             "maker_net_pnl": maker["net_maker_pnl"],
             "total_value": total_value,
             "pnl": total_value - account.starting_balance,
@@ -742,16 +751,29 @@ class Engine:
         *,
         size: float | None = None,
         half_spread_cents: float | None = None,
+        cancel_efficiency: float = 0.0,
+        max_inventory: float | None = None,
+        skew_strength: float = MAKER_SKEW_STRENGTH,
         now: datetime | None = None,
     ) -> dict:
         """Place a resting two-sided maker quote to earn liquidity rewards.
 
-        The quote rests ``half_spread_cents`` either side of the current mid with
-        ``size`` shares per side (defaulting to the pool's ``min_size`` and one
-        tick in-band — the validated quoting recipe).  Pool config is pulled live
-        from the CLOB (see :meth:`PolymarketClient.get_reward_config`); the
+        The quote rests ``half_spread_cents`` either side of the (inventory-skewed)
+        mid with ``size`` shares per side (defaulting to the pool's ``min_size``
+        and one tick in-band).  Pool config is pulled live from the CLOB; the
         market must be in the liquidity-rewards program.  Reserves
         ``committed_capital`` out of cash until cancelled.
+
+        Inventory management (verified essential against trends):
+        - ``cancel_efficiency`` (0-1): colocation lever — fraction of adverse
+          fills a fast canceller pulls before they trade (scales fill size down).
+        - ``max_inventory`` (shares): position cap; at the cap the quote goes
+          one-sided (only the flattening side fills).  Defaults to 4 × size.
+        - ``skew_strength`` (≥0): inventory-skew lean — shifts the quote centre
+          away from inventory so the book mean-reverts toward flat (A-S idea).
+        A persistent trend still bleeds the held inventory (skew/cap bound it,
+        the drift-exit in ``accrue_maker_rewards`` ultimately flattens + exits);
+        the durable defence is selecting calm, range-bound pools.
         """
         account = self._require_account()
         market = self.api.get_market(slug_or_id)
@@ -779,6 +801,19 @@ class Engine:
             raise OrderRejectedError(
                 f"half_spread_cents must be in (0, {max_spread_c}], got {half_spread_c}"
             )
+        if not 0.0 <= cancel_efficiency <= 1.0:
+            raise OrderRejectedError(
+                f"cancel_efficiency must be in [0, 1], got {cancel_efficiency}"
+            )
+        if skew_strength < 0.0:
+            raise OrderRejectedError(
+                f"skew_strength must be >= 0, got {skew_strength}"
+            )
+        cap_shares = (MAKER_CAP_MULT * size) if max_inventory is None else max_inventory
+        if cap_shares <= 0:
+            raise OrderRejectedError(
+                f"max_inventory must be > 0, got {cap_shares}"
+            )
 
         token_id = market.get_token_id(outcome)
         mid = self.api.get_midpoint(token_id)
@@ -802,6 +837,10 @@ class Engine:
             min_size=min_size,
             daily_rate=daily_rate,
             tick=tick,
+            cancel_efficiency=cancel_efficiency,
+            max_inventory=cap_shares,
+            skew_strength=skew_strength,
+            entry_mid=mid,
             committed_capital=cap,
             last_mid=mid,
             last_accrued_at=_utcnow(now).isoformat(),
@@ -827,38 +866,35 @@ class Engine:
         return _maker_quote_to_dict(updated)
 
     def accrue_maker_rewards(self, now: datetime | None = None) -> list[dict]:
-        """Advance every active maker quote: accrue rewards, apply adverse bleed.
+        """Advance every active maker quote one inventory-aware poll.
 
         The agent-callable poll (call it periodically, like ``check_orders``).
-        For each active quote this first RECONCILES the pool against the live
-        rewards program: if the market has left the program (no reward config) or
-        its daily rate has dropped to 0 — or it has resolved — the quote is
-        auto-cancelled and its reserved capital freed, so dead capital rotates
-        out instead of accruing phantom reward.  Otherwise it fetches the live
-        book + mid and accrues a share of the pool's CURRENT daily rate (not the
-        stale rate captured at placement) for the elapsed in-band time, minus the
-        adverse-selection bleed if the mid jumped the quoted offset.  Net cash
-        impact per quote = reward − bleed; reserved capital is untouched.
+        For each active quote:
+          1. RECONCILE against the live program — if the pool stopped paying
+             (rewards ended / market resolved) flatten, free capital, cancel.
+          2. Accrue the reward share of the pool's CURRENT daily rate over the
+             elapsed in-band time.
+          3. INVENTORY: mark the held inventory at the new mid (the trend P&L),
+             then fill the resting inventory-skewed quote as the mid moved —
+             accumulating inventory (capped at ``max_inventory``, scaled by
+             ``cancel_efficiency``) and booking the adverse pick-off cost.
+          4. DRIFT-EXIT: if the mid has drifted a full band from ``entry_mid``
+             (a persistent trend or jump), flatten the inventory at mid, free
+             capital and cancel — the regime is no longer the calm pool we
+             entered.  Net cash per poll = reward + held-MTM − pick-off cost.
         """
         self._require_account()
         now_dt = _utcnow(now)
         results: list[dict] = []
         for quote in get_active_maker_quotes(self.db.conn):
-            # Reconcile: is this pool still paying rewards?
             try:
                 pool = self.api.get_reward_config(quote.market_condition_id)
             except Exception:
                 continue  # transient API/network error — retry next poll
             daily_rate = pool["daily"] if pool else 0.0
             if pool is None or daily_rate <= 0:
-                # rewards ended / market resolved → cancel, free capital, stop
-                account = self.get_account()
-                self.db.update_cash(account.cash + quote.committed_capital)
-                cancelled = _cancel_maker_quote(self.db.conn, quote.id)
-                results.append({
-                    "quote": _maker_quote_to_dict(cancelled),
-                    "reconciled": "rewards_ended",
-                })
+                # rewards ended / market resolved → flatten, free capital, stop
+                self._exit_maker_quote(quote, quote.last_mid, "rewards_ended", results)
                 continue
             try:
                 book = self.api.get_order_book(quote.token_id)
@@ -868,52 +904,68 @@ class Engine:
             if not (0.0 < mid < 1.0):
                 continue
 
-            # Catalyst jump: the mid moved beyond the entire reward band since the
-            # last poll — this is no longer the quiet SAFE pool we entered.  Take
-            # the one pickoff hit, then EXIT (cancel + free capital) instead of
-            # continuing to bleed on every later move (the reactive jump-halt).
-            if abs(mid - quote.last_mid) >= quote.max_spread_c / 100.0:
-                bleed = adverse_bleed(
-                    quote.size, quote.half_spread_c, quote.last_mid, mid
-                )
-                account = self.get_account()
-                self.db.update_cash(account.cash + quote.committed_capital - bleed)
-                cancelled = _cancel_maker_quote(self.db.conn, quote.id)
-                results.append({
-                    "quote": _maker_quote_to_dict(cancelled),
-                    "reconciled": "jump_exit",
-                    "bleed": round(bleed, 6),
-                    "mid": mid,
-                })
-                continue
-
             last_dt = datetime.fromisoformat(quote.last_accrued_at)
             seconds = max(0.0, (now_dt - last_dt).total_seconds())
 
+            # 2. Reward over the elapsed in-band time.
             existing_qmin = book_inband_qmin(book, mid, quote.max_spread_c)
             share = maker_reward_share(
                 quote.size, quote.half_spread_c, quote.max_spread_c, existing_qmin
             )
             reward = reward_accrual(share, daily_rate, seconds)
-            bleed = adverse_bleed(
-                quote.size, quote.half_spread_c, quote.last_mid, mid
-            )
 
-            account = self.get_account()
-            self.db.update_cash(account.cash + reward - bleed)
+            # 3. Inventory: held mark-to-market + the new fill from the move.
+            cap = (quote.max_inventory if quote.max_inventory > 0
+                   else MAKER_CAP_MULT * quote.size)  # 0 = unset → default cap
+            held_mtm = quote.inventory * (mid - quote.last_mid)
+            d_inv, fill_loss = maker_fill(
+                quote.last_mid, mid, quote.inventory, quote.size,
+                quote.half_spread_c, quote.skew_strength, quote.cancel_efficiency,
+                cap,
+            )
+            new_inventory = quote.inventory + d_inv
+            inv_pnl_delta = held_mtm - fill_loss
+
+            # 4. Drift-exit: a full-band move from entry → flatten + cancel.
+            entry_mid = quote.entry_mid if quote.entry_mid > 0 else mid
+            if abs(mid - entry_mid) >= quote.max_spread_c / 100.0:
+                # held inventory already marked at mid via inv_pnl_delta; bank the
+                # reward + inventory delta, then flatten (inventory → 0) and exit.
+                self._credit_maker(reward + inv_pnl_delta)
+                final = update_maker_quote_accrual(
+                    self.db.conn, quote.id,
+                    accrued_rewards=quote.accrued_rewards + reward,
+                    realized_bleed=quote.realized_bleed + fill_loss,
+                    fills=quote.fills + (1 if d_inv != 0 else 0),
+                    last_mid=mid,
+                    last_accrued_at=now_dt.isoformat(),
+                    inventory=0.0,
+                    inventory_pnl=quote.inventory_pnl + inv_pnl_delta,
+                )
+                self._exit_maker_quote(final, mid, "drift_exit", results,
+                                       reward=reward, fill_loss=fill_loss,
+                                       inventory_pnl_delta=inv_pnl_delta,
+                                       share=share, seconds=seconds)
+                continue
+
+            self._credit_maker(reward + inv_pnl_delta)
             updated = update_maker_quote_accrual(
                 self.db.conn,
                 quote.id,
                 accrued_rewards=quote.accrued_rewards + reward,
-                realized_bleed=quote.realized_bleed + bleed,
-                fills=quote.fills + (1 if bleed > 0 else 0),
+                realized_bleed=quote.realized_bleed + fill_loss,
+                fills=quote.fills + (1 if d_inv != 0 else 0),
                 last_mid=mid,
                 last_accrued_at=now_dt.isoformat(),
+                inventory=new_inventory,
+                inventory_pnl=quote.inventory_pnl + inv_pnl_delta,
             )
             results.append({
                 "quote": _maker_quote_to_dict(updated),
                 "reward": round(reward, 6),
-                "bleed": round(bleed, 6),
+                "fill_loss": round(fill_loss, 6),
+                "inventory_pnl_delta": round(inv_pnl_delta, 6),
+                "inventory": round(new_inventory, 4),
                 "share": round(share, 6),
                 "seconds": round(seconds, 2),
                 "mid": mid,
@@ -921,20 +973,120 @@ class Engine:
         self._record_equity()
         return results
 
+    def _credit_maker(self, amount: float) -> None:
+        """Mark a maker cash delta (reward + inventory P&L) to the account."""
+        self.db.update_cash(self.get_account().cash + amount)
+
+    def _exit_maker_quote(
+        self, quote, mid: float, reason: str, results: list[dict], **extra,
+    ) -> None:
+        """Flatten a quote's inventory at *mid*, free its capital, and cancel it.
+
+        ``quote.inventory_pnl`` is already marked at *mid*, so flattening realises
+        it at no extra cost; we just release the reserved capital and book a
+        crossing cost would go here for a true taker exit (paper: flatten at mid).
+        """
+        self.db.update_cash(self.get_account().cash + quote.committed_capital)
+        cancelled = _cancel_maker_quote(self.db.conn, quote.id)
+        row = {"quote": _maker_quote_to_dict(cancelled), "reconciled": reason,
+               "mid": mid}
+        row.update({k: round(v, 6) for k, v in extra.items()})
+        results.append(row)
+
+    def suggest_maker_half_spread(
+        self,
+        slug_or_id: str,
+        outcome: str = "yes",
+        *,
+        cancel_efficiency: float = 0.0,
+        poll_seconds: float = 60.0,
+    ) -> dict:
+        """Recommend the net-optimal half-spread (cents) for a reward pool.
+
+        Pulls the pool config, live book (competition Qmin) and recent price
+        history (volatility), then grid-searches the offset that maximises
+        ``reward − adverse_bleed`` per day at the given ``poll_seconds`` re-quote
+        cadence and ``cancel_efficiency``.  Embeds the Avellaneda-Stoikov tension
+        adapted to PM's reward subsidy: tighter earns a quadratically larger
+        reward share but bleeds more to adverse selection (see ``optimal_half_spread``).
+        """
+        self._require_account()
+        market = self.api.get_market(slug_or_id)
+        outcome = self._validate_outcome(outcome, market)
+        if not 0.0 <= cancel_efficiency <= 1.0:
+            raise OrderRejectedError(
+                f"cancel_efficiency must be in [0, 1], got {cancel_efficiency}"
+            )
+        if poll_seconds <= 0:
+            raise OrderRejectedError(f"poll_seconds must be > 0, got {poll_seconds}")
+
+        pool = self.api.get_reward_config(market.condition_id)
+        if pool is None:
+            raise OrderRejectedError(
+                f"{market.slug} is not in the liquidity-rewards program"
+            )
+        token_id = market.get_token_id(outcome)
+        book = self.api.get_order_book(token_id)
+        mid = self.api.get_midpoint(token_id)
+        if not (0.0 < mid < 1.0):
+            raise OrderRejectedError("No valid midpoint to anchor the maker quote")
+
+        existing_qmin = book_inband_qmin(book, mid, pool["max_spread"])
+        try:
+            history = self.api.prices_history(token_id)
+        except Exception:
+            history = []
+        sigma_c = realized_sigma_c_from_history(history, poll_seconds)
+
+        rec = optimal_half_spread(
+            daily_rate=pool["daily"],
+            max_spread_c=pool["max_spread"],
+            min_size=pool["min_size"],
+            tick_c=pool["tick"] * 100.0,
+            existing_qmin=existing_qmin,
+            sigma_c=sigma_c,
+            periods_per_day=86_400.0 / poll_seconds,
+            cancel_efficiency=cancel_efficiency,
+        )
+        rec.update({
+            "market_slug": market.slug,
+            "condition_id": market.condition_id,
+            "outcome": outcome,
+            "mid": mid,
+            "sigma_c": round(sigma_c, 4),
+            "existing_qmin": round(existing_qmin, 4),
+            "max_spread_c": pool["max_spread"],
+            "min_size": pool["min_size"],
+            "daily_rate": pool["daily"],
+            "tick_c": round(pool["tick"] * 100.0, 4),
+            "poll_seconds": poll_seconds,
+            "cancel_efficiency": cancel_efficiency,
+        })
+        return rec
+
     def get_maker_summary(self) -> dict:
-        """Aggregate maker P&L: committed capital, reward income, bleed, net."""
+        """Aggregate maker P&L: reward income, inventory P&L, pick-off bleed, net.
+
+        ``net_maker_pnl = reward_income + inventory_pnl`` (inventory P&L = held
+        mark-to-market + the adverse pick-off cost, usually ≤ 0 in a trend).
+        ``adverse_bleed`` is the pick-off sub-component, reported for colour.
+        """
         self._require_account()
         quotes = get_all_maker_quotes(self.db.conn)
         committed = sum(q.committed_capital for q in quotes if q.status == "active")
         reward_income = sum(q.accrued_rewards for q in quotes)
+        inventory_pnl = sum(q.inventory_pnl for q in quotes)
         bleed = sum(q.realized_bleed for q in quotes)
+        open_inventory = sum(q.inventory for q in quotes if q.status == "active")
         return {
             "active_quotes": sum(1 for q in quotes if q.status == "active"),
             "total_quotes": len(quotes),
             "committed_capital": committed,
+            "open_inventory": open_inventory,
             "reward_income": reward_income,
+            "inventory_pnl": inventory_pnl,
             "adverse_bleed": bleed,
-            "net_maker_pnl": reward_income - bleed,
+            "net_maker_pnl": reward_income + inventory_pnl,
         }
 
     # ------------------------------------------------------------------
@@ -1067,10 +1219,16 @@ def _maker_quote_to_dict(quote) -> dict:
         "min_size": quote.min_size,
         "daily_rate": quote.daily_rate,
         "tick": quote.tick,
+        "cancel_efficiency": quote.cancel_efficiency,
+        "max_inventory": quote.max_inventory,
+        "skew_strength": quote.skew_strength,
+        "inventory": quote.inventory,
+        "inventory_pnl": quote.inventory_pnl,
+        "entry_mid": quote.entry_mid,
         "committed_capital": quote.committed_capital,
         "accrued_rewards": quote.accrued_rewards,
         "realized_bleed": quote.realized_bleed,
-        "net_pnl": quote.accrued_rewards - quote.realized_bleed,
+        "net_pnl": quote.accrued_rewards + quote.inventory_pnl,
         "fills": quote.fills,
         "status": quote.status,
         "last_mid": quote.last_mid,

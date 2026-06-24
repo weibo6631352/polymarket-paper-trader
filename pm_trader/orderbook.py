@@ -7,6 +7,8 @@ trade simulation.
 
 from __future__ import annotations
 
+import math
+
 from pm_trader.models import Fill, FillResult, OrderBook
 
 
@@ -254,19 +256,79 @@ def reward_accrual(share: float, daily_rate: float, seconds: float) -> float:
 
 
 def adverse_bleed(
-    size: float, half_spread_c: float, mid_prev: float, mid_now: float
+    size: float,
+    half_spread_c: float,
+    mid_prev: float,
+    mid_now: float,
+    cancel_efficiency: float = 0.0,
 ) -> float:
-    """Adverse-selection loss when the mid moves past a resting quote side.
+    """Per-poll adverse-selection loss for a re-centering (no-inventory) maker.
 
-    A continuous maker re-centers each poll, so a move within ``half_spread_c``
-    of mid is harmless (the validated minute-level pick rate is ~0).  A larger
-    move fills the stale side at its quote price before the re-center, costing
-    ``size * (|move| - half_spread)`` — the portion of the move beyond the quoted
-    offset.  This is the discrete-jump bleed that kills deep marquee pools.
+    A move within ``half_spread_c`` of mid is harmless; a larger move fills the
+    stale side at its quote price before the re-center, costing
+    ``size * (|move| - half_spread) * (1 - cancel_efficiency)``.  This is the
+    mark-to-market approximation used by the ``maker_sim`` backtester (which
+    re-centers each step and never holds inventory).  The stateful engine uses
+    :func:`maker_fill` instead, which accumulates inventory and marks it.
     """
     offset = half_spread_c / 100.0
     excess = abs(mid_now - mid_prev) - offset
-    return size * excess if excess > 0 else 0.0
+    if excess <= 0:
+        return 0.0
+    return size * excess * max(0.0, 1.0 - cancel_efficiency)
+
+
+def skewed_center(
+    mid: float, inventory: float, size: float, half_spread_c: float,
+    skew_strength: float,
+) -> float:
+    """Inventory-skewed quote center — lean away from inventory to flatten it.
+
+    ``center = mid − skew_strength · (inventory/size) · offset`` (offset in price).
+    Long (inventory > 0) → center DOWN, so the ask is keener to be lifted (sell,
+    get flat) and the bid less keen to be hit; short → center UP.  This is the
+    Avellaneda-Stoikov / Ho-Stoll reservation-price idea: quote around an
+    inventory-adjusted fair value so the book mean-reverts toward flat.
+    """
+    offset = half_spread_c / 100.0
+    return mid - skew_strength * (inventory / size) * offset if size > 0 else mid
+
+
+def maker_fill(
+    mid_prev: float,
+    mid_now: float,
+    inventory: float,
+    size: float,
+    half_spread_c: float,
+    skew_strength: float,
+    cancel_efficiency: float,
+    max_inventory: float,
+) -> tuple[float, float]:
+    """Simulate the fill of the resting (skewed) quote as the mid moves prev→now.
+
+    The quote rested ``half_spread_c`` cents either side of the skewed center
+    computed at ``mid_prev`` with the pre-move ``inventory``.  When the mid drops
+    through the bid we buy (inventory ↑); when it rises through the ask we sell
+    (inventory ↓).  Fill size is ``size·(1−cancel_efficiency)`` — a faster
+    canceller pulls more of the stale side before it trades — and is clamped so
+    ``|inventory|`` never exceeds ``max_inventory`` (the position cap → one-sided
+    quoting at the cap).
+
+    Returns ``(delta_inventory, fill_loss)``: the signed inventory change and the
+    adverse-selection cost of the fill (``≥ 0``, the picked-off amount marked at
+    the new mid).
+    """
+    offset = half_spread_c / 100.0
+    center = skewed_center(mid_prev, inventory, size, half_spread_c, skew_strength)
+    bid, ask = center - offset, center + offset
+    f = size * max(0.0, 1.0 - cancel_efficiency)
+    if mid_now <= bid:                                   # bid hit → buy
+        f = min(f, max(0.0, max_inventory - inventory))
+        return f, f * (bid - mid_now)
+    if mid_now >= ask:                                   # ask lifted → sell
+        f = min(f, max(0.0, max_inventory + inventory))
+        return -f, f * (mid_now - ask)
+    return 0.0, 0.0
 
 
 def committed_capital(size: float, half_spread_c: float) -> float:
@@ -278,6 +340,125 @@ def committed_capital(size: float, half_spread_c: float) -> float:
     """
     cap = size * (1.0 - 2.0 * (half_spread_c / 100.0))
     return cap if cap > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Volatility-aware optimal quoting (Avellaneda-Stoikov, adapted to the subsidy)
+# ---------------------------------------------------------------------------
+#
+# Classic MM (Avellaneda-Stoikov) widens the spread with volatility to dodge
+# adverse selection: optimal half-spread ≈ inventory/vol term + fill-rate term.
+# Our case is INVERTED by the reward subsidy — PM pays a reward share that grows
+# QUADRATICALLY as the quote tightens (((c−s)/c)²), so there is a force pulling
+# us tighter that classic MM lacks.  The optimal offset therefore balances:
+#   reward(s)  — rises as s → 0 (bigger Qmin share of the daily pool), and
+#   bleed(s)   — also rises as s → 0 (more mid moves cross the quote and pick it
+#                off), scaling with volatility and shrunk by cancel_efficiency.
+# We grid-search s ∈ [tick, max_spread] for the net-maximising offset.
+
+
+def expected_excess_move(sigma: float, offset: float) -> float:
+    """E[max(|Δ| − offset, 0)] for a zero-mean Gaussian move with std ``sigma``.
+
+    Closed form for ``X ~ N(0, sigma²)`` and ``offset ≥ 0``::
+
+        E[(|X| − a)+] = 2·sigma·φ(a/sigma) − 2·a·(1 − Φ(a/sigma))
+
+    (φ = standard-normal PDF, Φ = its CDF).  This is the per-period adverse move
+    beyond a quote resting ``offset`` from mid — the bleed driver.  ``sigma`` and
+    ``offset`` share units (price or cents).  Returns 0 for non-positive sigma.
+    """
+    if sigma <= 0:
+        return 0.0
+    a = offset / sigma
+    phi = math.exp(-0.5 * a * a) / math.sqrt(2.0 * math.pi)
+    cdf = 0.5 * (1.0 + math.erf(a / math.sqrt(2.0)))
+    return max(0.0, 2.0 * sigma * phi - 2.0 * offset * (1.0 - cdf))
+
+
+def realized_sigma_c_from_history(history: list[dict], poll_seconds: float) -> float:
+    """Per-poll mid-move volatility (cents) from CLOB ``prices-history`` points.
+
+    Estimates the std of consecutive mid moves at the history's own cadence
+    (median timestamp gap), then scales to the ``poll_seconds`` re-quote interval
+    by random-walk √-time scaling.  Returns 0.0 when the path or cadence is
+    degenerate (treated as no measured risk → recommends the tightest quote).
+    """
+    prices: list[float] = []
+    ts: list[float] = []
+    for pt in history:
+        try:
+            prices.append(float(pt["p"]))
+            ts.append(float(pt["t"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(prices) < 2 or poll_seconds <= 0:
+        return 0.0
+    gaps = sorted(ts[i] - ts[i - 1] for i in range(1, len(ts)) if ts[i] > ts[i - 1])
+    if not gaps:
+        return 0.0
+    step = gaps[len(gaps) // 2]  # all gaps are positive by construction
+    diffs_c = [(prices[i] - prices[i - 1]) * 100.0 for i in range(1, len(prices))]
+    n = len(diffs_c)
+    mean = sum(diffs_c) / n
+    var = sum((d - mean) ** 2 for d in diffs_c) / n
+    return (var ** 0.5) * (poll_seconds / step) ** 0.5
+
+
+def optimal_half_spread(
+    *,
+    daily_rate: float,
+    max_spread_c: float,
+    min_size: float,
+    tick_c: float,
+    existing_qmin: float,
+    sigma_c: float,
+    periods_per_day: float,
+    cancel_efficiency: float = 0.0,
+    grid: int = 200,
+) -> dict:
+    """Grid-search the half-spread (cents) that maximises net daily maker yield.
+
+    ``net(s) = reward(s) − bleed(s)`` where
+    ``reward(s) = daily_rate · own(s)/(own(s)+existing_qmin)`` with
+    ``own(s) = min_size·((c−s)/c)²``, and
+    ``bleed(s) = (1−eff)·min_size·E[(|Δ|−s)+]·periods_per_day`` for
+    ``Δ ~ N(0, sigma_c²)``.  Searches ``s ∈ [tick_c, max_spread_c]`` and returns
+    the best offset plus its net/reward/bleed/share.  With ``sigma_c = 0`` the
+    bleed term vanishes and the tightest quote (``tick_c``) wins — the pure
+    reward-maximising case.
+    """
+    lo, hi = tick_c, max_spread_c
+    if grid < 1:
+        grid = 1
+    if hi <= lo:
+        candidates = [lo]
+    else:
+        step = (hi - lo) / grid
+        candidates = [lo + i * step for i in range(grid + 1)]
+
+    best: dict | None = None
+    for s in candidates:
+        own = maker_quote_score(min_size, s, max_spread_c)
+        denom = own + existing_qmin
+        share = (own / denom) if denom > 0 else 0.0
+        reward = share * daily_rate
+        bleed = (
+            max(0.0, 1.0 - cancel_efficiency)
+            * min_size
+            * (expected_excess_move(sigma_c, s) / 100.0)
+            * periods_per_day
+        )
+        net = reward - bleed
+        if best is None or net > best["net_per_day"]:
+            best = {
+                "half_spread_c": round(s, 4),
+                "net_per_day": round(net, 4),
+                "reward_per_day": round(reward, 4),
+                "bleed_per_day": round(bleed, 4),
+                "share": round(share, 4),
+            }
+    return best
 
 
 # ---------------------------------------------------------------------------

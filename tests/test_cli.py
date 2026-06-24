@@ -660,6 +660,7 @@ class TestMakerCommands:
         m.get_reward_config.return_value = dict(MAKER_POOL) if in_program else None
         m.get_order_book.return_value = SAMPLE_BOOK
         m.get_midpoint.return_value = 0.65
+        m.prices_history.return_value = []
         return m
 
     @patch("pm_trader.engine.PolymarketClient")
@@ -673,6 +674,19 @@ class TestMakerCommands:
         assert data["ok"] is True
         assert data["data"]["status"] == "active"
         assert data["data"]["committed_capital"] == pytest.approx(49.0)
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_place_cancel_efficiency(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        result = _invoke(
+            runner,
+            ["maker", "place", "will-bitcoin-hit-100k", "--cancel-efficiency", "0.9"],
+            data_dir,
+        )
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["cancel_efficiency"] == pytest.approx(0.9)
 
     @patch("pm_trader.engine.PolymarketClient")
     def test_maker_place_not_in_program(self, MockClient, runner, data_dir):
@@ -734,6 +748,25 @@ class TestMakerCommands:
         data = _parse(result)
         assert data["ok"] is False
         assert data["code"] == "QUOTE_NOT_FOUND"
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_suggest(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        result = _invoke(
+            runner,
+            ["maker", "suggest", "will-bitcoin-hit-100k", "--cancel-efficiency", "0.5"],
+            data_dir,
+        )
+        data = _parse(result)
+        assert data["ok"] is True
+        assert "half_spread_c" in data["data"]
+        assert data["data"]["cancel_efficiency"] == pytest.approx(0.5)
+
+    def test_maker_suggest_not_initialized(self, runner, data_dir):
+        result = _invoke(runner, ["maker", "suggest", "will-bitcoin-hit-100k"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["ok"] is False
 
     def test_maker_list_not_initialized(self, runner, data_dir):
         result = _invoke(runner, ["maker", "list"], data_dir)

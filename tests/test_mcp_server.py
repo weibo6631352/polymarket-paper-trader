@@ -51,6 +51,7 @@ from pm_trader.mcp_server import (
     share_content,
     stats,
     stats_card,
+    suggest_maker_quote,
     watch_prices,
 )
 
@@ -1108,6 +1109,7 @@ def _mock_maker_engine(engine, in_program=True):
     engine.api.get_reward_config = MagicMock(
         return_value=dict(MAKER_POOL) if in_program else None
     )
+    engine.api.prices_history = MagicMock(return_value=[])
 
 
 class TestMakerTools:
@@ -1130,6 +1132,16 @@ class TestMakerTools:
         assert result["ok"] is True
         assert result["data"]["size"] == 100.0
         assert result["data"]["half_spread_c"] == pytest.approx(2.0)
+
+    def test_place_with_cancel_efficiency(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        result = _parse(place_maker_quote(
+            "will-bitcoin-hit-100k", cancel_efficiency=0.9
+        ))
+        assert result["ok"] is True
+        assert result["data"]["cancel_efficiency"] == pytest.approx(0.9)
 
     def test_place_not_in_program(self):
         init_account()
@@ -1205,6 +1217,17 @@ class TestMakerTools:
     def test_cancel_maker_quote_not_initialized(self):
         result = _parse(cancel_maker_quote(1))
         assert result["ok"] is False
+
+    def test_suggest_maker_quote(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        result = _parse(suggest_maker_quote("will-bitcoin-hit-100k"))
+        assert result["ok"] is True
+        assert "half_spread_c" in result["data"]
+
+    def test_suggest_not_initialized(self):
+        assert _parse(suggest_maker_quote("will-bitcoin-hit-100k"))["ok"] is False
 
     def test_list_not_initialized(self):
         assert _parse(list_maker_quotes())["ok"] is False

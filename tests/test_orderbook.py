@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+import math
+
 from pm_trader.models import OrderBook, OrderBookLevel
 from pm_trader.orderbook import (
     _inband_weight,
@@ -16,11 +18,16 @@ from pm_trader.orderbook import (
     book_inband_qmin,
     calculate_fee,
     committed_capital,
+    expected_excess_move,
+    maker_fill,
     maker_quote_score,
     maker_reward_share,
+    optimal_half_spread,
+    realized_sigma_c_from_history,
     reward_accrual,
     simulate_buy_fill,
     simulate_sell_fill,
+    skewed_center,
 )
 
 
@@ -787,6 +794,17 @@ class TestAdverseBleed:
     def test_symmetric_up_move(self) -> None:
         assert adverse_bleed(50.0, 1.0, 0.50, 0.55) == pytest.approx(2.0)
 
+    def test_cancel_efficiency_halves_bleed(self) -> None:
+        # 50% fast-cancel avoids half the pickoff
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.45, 0.5) == pytest.approx(1.0)
+
+    def test_perfect_cancel_no_bleed(self) -> None:
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.45, 1.0) == 0.0
+
+    def test_cancel_efficiency_clamped_above_one(self) -> None:
+        # eff > 1 cannot create negative (profit) bleed
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.45, 1.5) == 0.0
+
 
 class TestCommittedCapital:
     def test_typical(self) -> None:
@@ -795,3 +813,149 @@ class TestCommittedCapital:
 
     def test_wide_quote_clamped_to_zero(self) -> None:
         assert committed_capital(50.0, 60.0) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Volatility-aware optimal quoting
+# ---------------------------------------------------------------------------
+
+class TestExpectedExcessMove:
+    def test_offset_zero_equals_mean_abs(self) -> None:
+        # E[|X|] = sigma * sqrt(2/pi)
+        assert expected_excess_move(2.0, 0.0) == pytest.approx(2.0 * math.sqrt(2 / math.pi))
+
+    def test_zero_sigma(self) -> None:
+        assert expected_excess_move(0.0, 1.0) == 0.0
+
+    def test_decreasing_in_offset(self) -> None:
+        assert expected_excess_move(2.0, 1.0) > expected_excess_move(2.0, 3.0)
+
+    def test_large_offset_near_zero(self) -> None:
+        assert expected_excess_move(1.0, 10.0) == pytest.approx(0.0, abs=1e-6)
+
+
+class TestRealizedSigmaFromHistory:
+    def test_too_few_points(self) -> None:
+        assert realized_sigma_c_from_history([{"t": 1, "p": 0.5}], 60.0) == 0.0
+
+    def test_nonpositive_poll(self) -> None:
+        h = [{"t": 0, "p": 0.5}, {"t": 60, "p": 0.51}]
+        assert realized_sigma_c_from_history(h, 0.0) == 0.0
+
+    def test_bad_points_skipped(self) -> None:
+        h = [{"t": "x", "p": 0.5}, {"t": 0, "p": 0.5}, {"t": 60, "p": 0.5}]
+        assert realized_sigma_c_from_history(h, 60.0) == 0.0  # flat → 0 vol
+
+    def test_no_positive_gaps(self) -> None:
+        h = [{"t": 5, "p": 0.50}, {"t": 5, "p": 0.51}]  # same timestamp
+        assert realized_sigma_c_from_history(h, 60.0) == 0.0
+
+    def test_positive_and_sqrt_time_scaling(self) -> None:
+        h = [{"t": 0, "p": 0.50}, {"t": 60, "p": 0.51},
+             {"t": 120, "p": 0.50}, {"t": 180, "p": 0.51}]
+        s60 = realized_sigma_c_from_history(h, 60.0)
+        s240 = realized_sigma_c_from_history(h, 240.0)
+        assert s60 > 0
+        # 4x the interval → 2x the sigma (random-walk scaling)
+        assert s240 == pytest.approx(2.0 * s60)
+
+
+class TestOptimalHalfSpread:
+    def _base(self, **kw):
+        d = dict(
+            daily_rate=100.0, max_spread_c=4.0, min_size=50.0, tick_c=1.0,
+            existing_qmin=0.0, sigma_c=0.0, periods_per_day=1440.0,
+            cancel_efficiency=0.0,
+        )
+        d.update(kw)
+        return optimal_half_spread(**d)
+
+    def test_zero_vol_picks_tightest(self) -> None:
+        # no bleed → reward strictly decreasing in s → optimal is the tightest
+        r = self._base(sigma_c=0.0)
+        assert r["half_spread_c"] == pytest.approx(1.0)
+        assert r["bleed_per_day"] == 0.0
+
+    def test_high_vol_widens(self) -> None:
+        r = self._base(sigma_c=2.0)
+        assert r["half_spread_c"] > 1.0
+
+    def test_perfect_cancel_picks_tightest(self) -> None:
+        # eff=1 kills bleed even at high vol → tightest again
+        r = self._base(sigma_c=2.0, cancel_efficiency=1.0)
+        assert r["half_spread_c"] == pytest.approx(1.0)
+
+    def test_competition_lowers_share(self) -> None:
+        r = self._base(existing_qmin=10_000.0)
+        assert 0.0 < r["share"] < 0.5
+
+    def test_degenerate_band_single_candidate(self) -> None:
+        # tick wider than the band → only one candidate evaluated
+        r = optimal_half_spread(
+            daily_rate=100.0, max_spread_c=1.0, min_size=50.0, tick_c=2.0,
+            existing_qmin=0.0, sigma_c=0.0, periods_per_day=1440.0,
+        )
+        assert r["half_spread_c"] == pytest.approx(2.0)
+
+    def test_grid_floor(self) -> None:
+        # grid < 1 is clamped to 1 (two candidates: lo and hi)
+        r = optimal_half_spread(
+            daily_rate=100.0, max_spread_c=4.0, min_size=50.0, tick_c=1.0,
+            existing_qmin=0.0, sigma_c=0.0, periods_per_day=1440.0, grid=0,
+        )
+        assert r["half_spread_c"] in (pytest.approx(1.0), pytest.approx(4.0))
+
+
+# ---------------------------------------------------------------------------
+# Inventory-aware quoting: skewed_center + maker_fill
+# ---------------------------------------------------------------------------
+
+class TestSkewedCenter:
+    def test_flat_is_mid(self) -> None:
+        assert skewed_center(0.50, 0.0, 50.0, 1.0, 1.0) == pytest.approx(0.50)
+
+    def test_long_skews_down(self) -> None:
+        # long 50 (= 1 size-unit), 1c offset, strength 1 → center mid - 1c
+        assert skewed_center(0.50, 50.0, 50.0, 1.0, 1.0) == pytest.approx(0.49)
+
+    def test_short_skews_up(self) -> None:
+        assert skewed_center(0.50, -50.0, 50.0, 1.0, 1.0) == pytest.approx(0.51)
+
+    def test_zero_size_is_mid(self) -> None:
+        assert skewed_center(0.50, 10.0, 0.0, 1.0, 1.0) == pytest.approx(0.50)
+
+
+class TestMakerFill:
+    def test_bid_hit_buys(self) -> None:
+        # mid drops to 0.47, bid at 0.49 → buy 50, loss 50*(0.49-0.47)=1.0
+        d_inv, loss = maker_fill(0.50, 0.47, 0.0, 50.0, 1.0, 1.0, 0.0, 200.0)
+        assert d_inv == pytest.approx(50.0)
+        assert loss == pytest.approx(1.0)
+
+    def test_ask_lifted_sells(self) -> None:
+        # mid rises to 0.53, ask at 0.51 → sell 50, loss 50*(0.53-0.51)=1.0
+        d_inv, loss = maker_fill(0.50, 0.53, 0.0, 50.0, 1.0, 1.0, 0.0, 200.0)
+        assert d_inv == pytest.approx(-50.0)
+        assert loss == pytest.approx(1.0)
+
+    def test_no_fill_within_quote(self) -> None:
+        d_inv, loss = maker_fill(0.50, 0.505, 0.0, 50.0, 1.0, 1.0, 0.0, 200.0)
+        assert (d_inv, loss) == (0.0, 0.0)
+
+    def test_buy_clamped_by_cap(self) -> None:
+        # already long 180, cap 200 → only 20 more (skew off for predictability)
+        d_inv, loss = maker_fill(0.50, 0.40, 180.0, 50.0, 1.0, 0.0, 0.0, 200.0)
+        assert d_inv == pytest.approx(20.0)
+        assert loss == pytest.approx(20.0 * (0.49 - 0.40))
+
+    def test_sell_clamped_by_cap(self) -> None:
+        # already short 180, cap 200 → only 20 more
+        d_inv, loss = maker_fill(0.50, 0.60, -180.0, 50.0, 1.0, 0.0, 0.0, 200.0)
+        assert d_inv == pytest.approx(-20.0)
+        assert loss == pytest.approx(20.0 * (0.60 - 0.51))
+
+    def test_cancel_efficiency_scales_fill(self) -> None:
+        # eff 0.5 → only half the size fills
+        d_inv, loss = maker_fill(0.50, 0.47, 0.0, 50.0, 1.0, 1.0, 0.5, 200.0)
+        assert d_inv == pytest.approx(25.0)
+        assert loss == pytest.approx(0.5)
