@@ -1008,17 +1008,32 @@ class TestAccrueMakerRewards:
         assert results[0]["share"] == pytest.approx(1.0 / 3.0)
         assert results[0]["reward"] == pytest.approx(100.0 / 3.0)
 
-    def test_adverse_bleed_on_jump(self, initialized_engine: Engine):
+    def test_adverse_bleed_within_band(self, initialized_engine: Engine):
         eng = initialized_engine
         _mock_maker_api(eng)
         eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
-        # mid jumps 5c with no elapsed time → pure bleed, no reward
-        eng.api.get_midpoint.return_value = 0.45
+        # mid moves 3c (inside the 4c band) → bleed but keep quoting, no jump-exit
+        eng.api.get_midpoint.return_value = 0.47
         results = eng.accrue_maker_rewards(now=T0)
         assert results[0]["reward"] == 0.0
-        assert results[0]["bleed"] == pytest.approx(2.0)  # 50 * (0.05 - 0.01)
+        assert results[0]["bleed"] == pytest.approx(1.0)  # 50 * (0.03 - 0.01)
         assert results[0]["quote"]["fills"] == 1
-        assert eng.get_account().cash == pytest.approx(9951.0 - 2.0)
+        assert results[0]["quote"]["status"] == "active"      # still quoting
+        assert eng.get_account().cash == pytest.approx(9951.0 - 1.0)
+
+    def test_catalyst_jump_exits(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        # mid jumps 5c — beyond the 4c band → take the hit, then exit (cancel)
+        eng.api.get_midpoint.return_value = 0.45
+        results = eng.accrue_maker_rewards(now=T0)
+        assert results[0]["reconciled"] == "jump_exit"
+        assert results[0]["bleed"] == pytest.approx(2.0)      # 50 * (0.05 - 0.01)
+        assert results[0]["quote"]["status"] == "cancelled"
+        assert eng.get_maker_quotes() == []                   # exited
+        # capital freed (49) minus the one bleed (2): 9951 + 49 - 2
+        assert eng.get_account().cash == pytest.approx(9998.0)
 
     def test_transient_book_error_skipped(self, initialized_engine: Engine):
         eng = initialized_engine

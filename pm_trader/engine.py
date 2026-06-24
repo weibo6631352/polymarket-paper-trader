@@ -868,6 +868,25 @@ class Engine:
             if not (0.0 < mid < 1.0):
                 continue
 
+            # Catalyst jump: the mid moved beyond the entire reward band since the
+            # last poll — this is no longer the quiet SAFE pool we entered.  Take
+            # the one pickoff hit, then EXIT (cancel + free capital) instead of
+            # continuing to bleed on every later move (the reactive jump-halt).
+            if abs(mid - quote.last_mid) >= quote.max_spread_c / 100.0:
+                bleed = adverse_bleed(
+                    quote.size, quote.half_spread_c, quote.last_mid, mid
+                )
+                account = self.get_account()
+                self.db.update_cash(account.cash + quote.committed_capital - bleed)
+                cancelled = _cancel_maker_quote(self.db.conn, quote.id)
+                results.append({
+                    "quote": _maker_quote_to_dict(cancelled),
+                    "reconciled": "jump_exit",
+                    "bleed": round(bleed, 6),
+                    "mid": mid,
+                })
+                continue
+
             last_dt = datetime.fromisoformat(quote.last_accrued_at)
             seconds = max(0.0, (now_dt - last_dt).total_seconds())
 
