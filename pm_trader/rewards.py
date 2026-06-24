@@ -190,12 +190,28 @@ class RewardsClient:
         except httpx.RequestError as e:
             raise ApiError(f"Polymarket CLOB API request failed: {e}") from e
 
-    def sampling_markets(self) -> list[dict]:
-        """Fetch reward-enabled markets (those in the liquidity-rewards program)."""
-        data = self._get(f"{CLOB_BASE}/sampling-markets")
-        if isinstance(data, dict):
-            data = data.get("data", [])
-        return data if isinstance(data, list) else []
+    def sampling_markets(self, *, max_pages: int = 100) -> list[dict]:
+        """Fetch ALL reward-enabled markets, following pagination.
+
+        The endpoint returns up to ~1000 per page with a ``next_cursor``; market
+        discovery must NOT stop at page 1 (that misses the bulk of high-reward
+        pools).  Follows the cursor until it ends (``""``/``"LTE="``) or repeats;
+        ``max_pages`` is only a runaway safety bound, not an opportunity cap.
+        """
+        out: list[dict] = []
+        cursor = ""
+        for _ in range(max_pages):
+            params = {"next_cursor": cursor} if cursor else None
+            data = self._get(f"{CLOB_BASE}/sampling-markets", params=params)
+            page = data.get("data", []) if isinstance(data, dict) else data
+            if not isinstance(page, list) or not page:
+                break
+            out.extend(page)
+            nxt = data.get("next_cursor", "") if isinstance(data, dict) else ""
+            if nxt in ("", "LTE=") or nxt == cursor:
+                break
+            cursor = nxt
+        return out
 
     def book(self, token_id: str) -> dict:
         """Fetch the live order book for a CLOB token."""

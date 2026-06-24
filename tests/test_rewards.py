@@ -258,6 +258,13 @@ class TestRewardsClientHTTP:
         httpx_mock.add_response(url=CLOB_BASE + "/sampling-markets", json={"data": "x"})
         assert client.sampling_markets() == []
 
+    def test_sampling_markets_paginates(self, client, httpx_mock):
+        httpx_mock.add_response(json={"data": [_market()], "next_cursor": "ABC"})
+        httpx_mock.add_response(json={"data": [_market()], "next_cursor": "LTE="})
+        rows = client.sampling_markets()
+        assert len(rows) == 2
+        assert len(httpx_mock.get_requests()) == 2
+
     def test_book_success(self, client, httpx_mock):
         httpx_mock.add_response(json={"bids": [{"price": 0.5, "size": 1}], "asks": []})
         book = client.book(TOKEN)
