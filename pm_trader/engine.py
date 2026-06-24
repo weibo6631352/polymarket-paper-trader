@@ -6,6 +6,7 @@ the API client, order book simulator, and database layer.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pm_trader.api import PolymarketClient
@@ -27,16 +28,30 @@ from pm_trader.models import (
 )
 from pm_trader.orders import (
     cancel_all_orders as _cancel_all_orders,
+    cancel_maker_quote as _cancel_maker_quote,
     cancel_order,
+    create_maker_quote,
     create_order,
     expire_orders,
+    get_active_maker_quotes,
+    get_all_maker_quotes,
+    get_maker_quote,
     get_pending_orders,
     init_orders_schema,
     mark_filled,
     reject_order,
     should_fill,
+    update_maker_quote_accrual,
 )
-from pm_trader.orderbook import simulate_buy_fill, simulate_sell_fill
+from pm_trader.orderbook import (
+    adverse_bleed,
+    book_inband_qmin,
+    committed_capital,
+    maker_reward_share,
+    reward_accrual,
+    simulate_buy_fill,
+    simulate_sell_fill,
+)
 
 MIN_ORDER_USD = 1.0  # Polymarket minimum order size
 
@@ -385,16 +400,29 @@ class Engine:
     # ------------------------------------------------------------------
 
     def get_balance(self) -> dict:
-        """Return cash, positions value, and total account value."""
+        """Return cash, positions value, maker income, and total account value.
+
+        Capital locked behind active maker quotes (``maker_committed_capital``)
+        is reserved out of cash but still owned, so it is added back into
+        ``total_value``.  Reward income and adverse bleed already flow through
+        cash; they are surfaced separately here so maker P&L is legible.
+        """
         account = self._require_account()
         portfolio = self.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio)
+        maker = self.get_maker_summary()
+        committed = maker["committed_capital"]
+        total_value = account.cash + positions_value + committed
         return {
             "cash": account.cash,
             "starting_balance": account.starting_balance,
             "positions_value": positions_value,
-            "total_value": account.cash + positions_value,
-            "pnl": (account.cash + positions_value) - account.starting_balance,
+            "maker_committed_capital": committed,
+            "maker_reward_income": maker["reward_income"],
+            "maker_adverse_bleed": maker["adverse_bleed"],
+            "maker_net_pnl": maker["net_maker_pnl"],
+            "total_value": total_value,
+            "pnl": total_value - account.starting_balance,
         }
 
     # ------------------------------------------------------------------
@@ -421,7 +449,7 @@ class Engine:
             account = self.db.get_account()
             if account is None:
                 return
-            equity = account.cash
+            equity = account.cash + self._committed_maker_capital()
             for pos in self.db.get_open_positions():
                 if (mark is not None
                         and pos.market_condition_id == mark[0]
@@ -434,6 +462,12 @@ class Engine:
         except Exception:
             pass  # never let bookkeeping break a trade
 
+    def _committed_maker_capital(self) -> float:
+        """Cash currently reserved behind active maker quotes."""
+        return sum(
+            q.committed_capital for q in get_active_maker_quotes(self.db.conn)
+        )
+
     def snapshot_equity(self) -> float:
         """Record and return a fully live mark-to-market equity snapshot.
 
@@ -442,7 +476,7 @@ class Engine:
         build a credible equity curve for Sharpe / drawdown analytics.
         """
         account = self._require_account()
-        equity = account.cash
+        equity = account.cash + self._committed_maker_capital()
         for pos in self.db.get_open_positions():
             try:
                 token_id = self._get_token_id_for_position(pos)
@@ -698,6 +732,173 @@ class Engine:
         return results
 
     # ------------------------------------------------------------------
+    # Maker quotes (liquidity-rewards two-sided quoting)
+    # ------------------------------------------------------------------
+
+    def place_maker_quote(
+        self,
+        slug_or_id: str,
+        outcome: str = "yes",
+        *,
+        size: float | None = None,
+        half_spread_cents: float | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        """Place a resting two-sided maker quote to earn liquidity rewards.
+
+        The quote rests ``half_spread_cents`` either side of the current mid with
+        ``size`` shares per side (defaulting to the pool's ``min_size`` and one
+        tick in-band — the validated quoting recipe).  Pool config is pulled live
+        from the CLOB (see :meth:`PolymarketClient.get_reward_config`); the
+        market must be in the liquidity-rewards program.  Reserves
+        ``committed_capital`` out of cash until cancelled.
+        """
+        account = self._require_account()
+        market = self.api.get_market(slug_or_id)
+        outcome = self._validate_outcome(outcome, market)
+        if market.closed:
+            raise MarketClosedError(market.slug)
+
+        pool = self.api.get_reward_config(market.condition_id)
+        if pool is None:
+            raise OrderRejectedError(
+                f"{market.slug} is not in the liquidity-rewards program"
+            )
+        max_spread_c = pool["max_spread"]
+        min_size = pool["min_size"]
+        daily_rate = pool["daily"]
+        tick = pool["tick"]
+
+        size = min_size if size is None else size
+        if size < min_size:
+            raise OrderRejectedError(
+                f"Maker size {size:.2f} below pool min_size {min_size:.2f}"
+            )
+        half_spread_c = (tick * 100.0) if half_spread_cents is None else half_spread_cents
+        if half_spread_c <= 0 or half_spread_c > max_spread_c:
+            raise OrderRejectedError(
+                f"half_spread_cents must be in (0, {max_spread_c}], got {half_spread_c}"
+            )
+
+        token_id = market.get_token_id(outcome)
+        mid = self.api.get_midpoint(token_id)
+        if not (0.0 < mid < 1.0):
+            raise OrderRejectedError("No valid midpoint to anchor the maker quote")
+
+        cap = committed_capital(size, half_spread_c)
+        if cap > account.cash:
+            raise InsufficientBalanceError(required=cap, available=account.cash)
+        self.db.update_cash(account.cash - cap)
+
+        quote = create_maker_quote(
+            self.db.conn,
+            market_slug=market.slug,
+            market_condition_id=market.condition_id,
+            outcome=outcome,
+            token_id=token_id,
+            size=size,
+            half_spread_c=half_spread_c,
+            max_spread_c=max_spread_c,
+            min_size=min_size,
+            daily_rate=daily_rate,
+            tick=tick,
+            committed_capital=cap,
+            last_mid=mid,
+            last_accrued_at=_utcnow(now).isoformat(),
+        )
+        self._record_equity()
+        return _maker_quote_to_dict(quote)
+
+    def get_maker_quotes(self) -> list[dict]:
+        """Return all active maker quotes."""
+        self._require_account()
+        return [_maker_quote_to_dict(q) for q in get_active_maker_quotes(self.db.conn)]
+
+    def cancel_maker_quote(self, quote_id: int) -> dict | None:
+        """Cancel an active maker quote and release its reserved capital."""
+        self._require_account()
+        quote = get_maker_quote(self.db.conn, quote_id)
+        if quote is None or quote.status != "active":
+            return None
+        account = self.get_account()
+        self.db.update_cash(account.cash + quote.committed_capital)
+        updated = _cancel_maker_quote(self.db.conn, quote_id)
+        self._record_equity()
+        return _maker_quote_to_dict(updated)
+
+    def accrue_maker_rewards(self, now: datetime | None = None) -> list[dict]:
+        """Advance every active maker quote: accrue rewards, apply adverse bleed.
+
+        The agent-callable poll (call it periodically, like ``check_orders``).
+        For each active quote this fetches the live book + mid, accrues a share
+        of the pool's daily rate for the elapsed in-band time, and — if the mid
+        moved past the quoted offset since the last poll — charges the
+        adverse-selection bleed of the stale side being picked off.  Net cash
+        impact per quote = reward − bleed; reserved capital is untouched.
+        """
+        self._require_account()
+        now_dt = _utcnow(now)
+        results: list[dict] = []
+        for quote in get_active_maker_quotes(self.db.conn):
+            try:
+                book = self.api.get_order_book(quote.token_id)
+                mid = self.api.get_midpoint(quote.token_id)
+            except Exception:
+                continue  # transient API/network error — retry next poll
+            if not (0.0 < mid < 1.0):
+                continue
+
+            last_dt = datetime.fromisoformat(quote.last_accrued_at)
+            seconds = max(0.0, (now_dt - last_dt).total_seconds())
+
+            existing_qmin = book_inband_qmin(book, mid, quote.max_spread_c)
+            share = maker_reward_share(
+                quote.size, quote.half_spread_c, quote.max_spread_c, existing_qmin
+            )
+            reward = reward_accrual(share, quote.daily_rate, seconds)
+            bleed = adverse_bleed(
+                quote.size, quote.half_spread_c, quote.last_mid, mid
+            )
+
+            account = self.get_account()
+            self.db.update_cash(account.cash + reward - bleed)
+            updated = update_maker_quote_accrual(
+                self.db.conn,
+                quote.id,
+                accrued_rewards=quote.accrued_rewards + reward,
+                realized_bleed=quote.realized_bleed + bleed,
+                fills=quote.fills + (1 if bleed > 0 else 0),
+                last_mid=mid,
+                last_accrued_at=now_dt.isoformat(),
+            )
+            results.append({
+                "quote": _maker_quote_to_dict(updated),
+                "reward": round(reward, 6),
+                "bleed": round(bleed, 6),
+                "share": round(share, 6),
+                "seconds": round(seconds, 2),
+                "mid": mid,
+            })
+        self._record_equity()
+        return results
+
+    def get_maker_summary(self) -> dict:
+        """Aggregate maker P&L: committed capital, reward income, bleed, net."""
+        self._require_account()
+        quotes = get_all_maker_quotes(self.db.conn)
+        committed = sum(q.committed_capital for q in quotes if q.status == "active")
+        reward_income = sum(q.accrued_rewards for q in quotes)
+        bleed = sum(q.realized_bleed for q in quotes)
+        return {
+            "active_quotes": sum(1 for q in quotes if q.status == "active"),
+            "total_quotes": len(quotes),
+            "committed_capital": committed,
+            "reward_income": reward_income,
+            "adverse_bleed": bleed,
+            "net_maker_pnl": reward_income - bleed,
+        }
+
+    # ------------------------------------------------------------------
     # Resolution
     # ------------------------------------------------------------------
 
@@ -805,4 +1006,35 @@ def _order_to_dict(order) -> dict:
         "status": order.status,
         "created_at": order.created_at,
         "filled_at": order.filled_at,
+    }
+
+
+def _utcnow(now: datetime | None) -> datetime:
+    """Return *now* if provided, else the current UTC time (for testability)."""
+    return now if now is not None else datetime.now(timezone.utc)
+
+
+def _maker_quote_to_dict(quote) -> dict:
+    """Convert a MakerQuote to a JSON-safe dict."""
+    return {
+        "id": quote.id,
+        "market_slug": quote.market_slug,
+        "market_condition_id": quote.market_condition_id,
+        "outcome": quote.outcome,
+        "token_id": quote.token_id,
+        "size": quote.size,
+        "half_spread_c": quote.half_spread_c,
+        "max_spread_c": quote.max_spread_c,
+        "min_size": quote.min_size,
+        "daily_rate": quote.daily_rate,
+        "tick": quote.tick,
+        "committed_capital": quote.committed_capital,
+        "accrued_rewards": quote.accrued_rewards,
+        "realized_bleed": quote.realized_bleed,
+        "net_pnl": quote.accrued_rewards - quote.realized_bleed,
+        "fills": quote.fills,
+        "status": quote.status,
+        "last_mid": quote.last_mid,
+        "created_at": quote.created_at,
+        "last_accrued_at": quote.last_accrued_at,
     }

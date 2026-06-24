@@ -171,3 +171,113 @@ class TestShouldFill:
         assert should_fill(order, 0.70) is True
         assert should_fill(order, 0.80) is True
         assert should_fill(order, 0.60) is False
+
+
+# ---------------------------------------------------------------------------
+# Maker quotes
+# ---------------------------------------------------------------------------
+
+from pm_trader.orders import (  # noqa: E402
+    MakerQuote,
+    cancel_maker_quote,
+    create_maker_quote,
+    get_active_maker_quotes,
+    get_all_maker_quotes,
+    get_maker_quote,
+    update_maker_quote_accrual,
+)
+
+
+def _create_maker(conn, **overrides):
+    defaults = dict(
+        market_slug="test-market",
+        market_condition_id="0xabc",
+        outcome="yes",
+        token_id="tok_yes",
+        size=50.0,
+        half_spread_c=1.0,
+        max_spread_c=4.0,
+        min_size=50.0,
+        daily_rate=100.0,
+        tick=0.01,
+        committed_capital=49.0,
+        last_mid=0.50,
+        last_accrued_at="2026-06-24T00:00:00+00:00",
+    )
+    defaults.update(overrides)
+    return create_maker_quote(conn, **defaults)
+
+
+class TestCreateMakerQuote:
+    def test_creates_active_quote(self, conn):
+        q = _create_maker(conn)
+        assert isinstance(q, MakerQuote)
+        assert q.id == 1
+        assert q.status == "active"
+        assert q.accrued_rewards == 0.0
+        assert q.realized_bleed == 0.0
+        assert q.fills == 0
+        assert q.daily_rate == 100.0
+        assert q.committed_capital == pytest.approx(49.0)
+        assert q.last_mid == pytest.approx(0.50)
+        assert q.created_at is not None
+
+    def test_auto_increments(self, conn):
+        a = _create_maker(conn)
+        b = _create_maker(conn)
+        assert b.id == a.id + 1
+
+
+class TestGetMakerQuotes:
+    def test_get_by_id(self, conn):
+        q = _create_maker(conn)
+        assert get_maker_quote(conn, q.id).id == q.id
+
+    def test_get_missing_none(self, conn):
+        assert get_maker_quote(conn, 999) is None
+
+    def test_active_excludes_cancelled(self, conn):
+        a = _create_maker(conn)
+        _create_maker(conn)
+        cancel_maker_quote(conn, a.id)
+        active = get_active_maker_quotes(conn)
+        assert [q.id for q in active] == [2]
+
+    def test_all_includes_cancelled(self, conn):
+        a = _create_maker(conn)
+        _create_maker(conn)
+        cancel_maker_quote(conn, a.id)
+        assert len(get_all_maker_quotes(conn)) == 2
+
+
+class TestCancelMakerQuote:
+    def test_cancel_active(self, conn):
+        q = _create_maker(conn)
+        cancelled = cancel_maker_quote(conn, q.id)
+        assert cancelled.status == "cancelled"
+
+    def test_cancel_missing_none(self, conn):
+        assert cancel_maker_quote(conn, 999) is None
+
+    def test_cancel_already_cancelled_none(self, conn):
+        q = _create_maker(conn)
+        cancel_maker_quote(conn, q.id)
+        assert cancel_maker_quote(conn, q.id) is None
+
+
+class TestUpdateMakerQuoteAccrual:
+    def test_persists_totals(self, conn):
+        q = _create_maker(conn)
+        updated = update_maker_quote_accrual(
+            conn, q.id,
+            accrued_rewards=1.25,
+            realized_bleed=0.50,
+            fills=1,
+            last_mid=0.52,
+            last_accrued_at="2026-06-24T01:00:00+00:00",
+        )
+        assert updated.accrued_rewards == pytest.approx(1.25)
+        assert updated.realized_bleed == pytest.approx(0.50)
+        assert updated.fills == 1
+        assert updated.last_mid == pytest.approx(0.52)
+        assert updated.last_accrued_at == "2026-06-24T01:00:00+00:00"

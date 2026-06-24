@@ -261,3 +261,37 @@ class TestComputeStats:
         stats = compute_stats([], _account(cash=8_000), positions_value=3_000)
         assert stats["total_value"] == pytest.approx(11_000)
         assert stats["pnl"] == pytest.approx(1_000)
+
+    def test_no_maker_activity_defaults_zero(self):
+        stats = compute_stats([], _account(cash=10_000), 0.0)
+        assert stats["reward_income"] == 0.0
+        assert stats["adverse_bleed"] == 0.0
+        assert stats["net_maker_pnl"] == 0.0
+        assert stats["committed_capital"] == 0.0
+        assert stats["trading_pnl"] == 0.0
+
+    def test_reward_income_decomposed(self):
+        # Reward income already sits in cash; committed capital is reserved out
+        # of cash but added back. Net maker P&L is carved out of total pnl.
+        stats = compute_stats(
+            [], _account(cash=10_049.0, starting=10_000.0),
+            positions_value=0.0,
+            reward_income=100.0,
+            adverse_bleed=0.0,
+            committed_capital=49.0,
+        )
+        assert stats["committed_capital"] == pytest.approx(49.0)
+        assert stats["total_value"] == pytest.approx(10_098.0)
+        assert stats["reward_income"] == pytest.approx(100.0)
+        assert stats["net_maker_pnl"] == pytest.approx(100.0)
+        assert stats["pnl"] == pytest.approx(98.0)
+        # trading P&L = total pnl minus maker P&L
+        assert stats["trading_pnl"] == pytest.approx(98.0 - 100.0)
+
+    def test_adverse_bleed_reduces_net_maker_pnl(self):
+        stats = compute_stats(
+            [], _account(cash=10_000.0, starting=10_000.0),
+            reward_income=10.0,
+            adverse_bleed=4.0,
+        )
+        assert stats["net_maker_pnl"] == pytest.approx(6.0)

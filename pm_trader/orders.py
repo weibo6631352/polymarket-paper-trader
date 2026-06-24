@@ -5,6 +5,14 @@ GTD (Good-Til-Date): GTC with an expiry timestamp.
 
 Orders are stored in SQLite and checked against live midpoint prices
 when the agent calls `pm-trader orders check`.
+
+This module also owns ``maker_quotes`` — resting two-sided liquidity-rewards
+quotes.  Unlike a one-sided limit order (which earns no reward, since the
+program scores the binding/lighter side and an absent side is 0), a maker quote
+rests ``half_spread_c`` cents either side of mid and accrues a share of the
+pool's daily USDC rate over its in-band uptime, net of adverse-selection bleed
+when the mid jumps through it.  Storage only — the accrual math lives in
+``orderbook`` and the orchestration in ``engine``.
 """
 
 from __future__ import annotations
@@ -59,11 +67,33 @@ CREATE TABLE IF NOT EXISTS limit_orders (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     filled_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS maker_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_slug TEXT NOT NULL,
+    market_condition_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (length(outcome) > 0),
+    token_id TEXT NOT NULL,
+    size REAL NOT NULL,
+    half_spread_c REAL NOT NULL,
+    max_spread_c REAL NOT NULL,
+    min_size REAL NOT NULL,
+    daily_rate REAL NOT NULL,
+    tick REAL NOT NULL,
+    committed_capital REAL NOT NULL,
+    accrued_rewards REAL NOT NULL DEFAULT 0,
+    realized_bleed REAL NOT NULL DEFAULT 0,
+    fills INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
+    last_mid REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_accrued_at TEXT NOT NULL
+);
 """
 
 
 def init_orders_schema(conn: sqlite3.Connection) -> None:
-    """Create the limit_orders table if it doesn't exist."""
+    """Create the limit_orders and maker_quotes tables if they don't exist."""
     conn.executescript(ORDERS_SCHEMA)
 
 
@@ -217,4 +247,169 @@ def _row_to_order(row: sqlite3.Row) -> LimitOrder:
         status=row["status"],
         created_at=row["created_at"],
         filled_at=row["filled_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Maker quotes (two-sided liquidity-rewards quotes)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MakerQuote:
+    """A resting two-sided maker quote that accrues liquidity rewards.
+
+    The quote rests ``half_spread_c`` cents either side of the midpoint with
+    ``size`` shares per side.  Pool config (``max_spread_c``, ``min_size``,
+    ``daily_rate``, ``tick``) is captured at placement.  ``accrued_rewards`` and
+    ``realized_bleed`` are running totals; ``committed_capital`` is the cash
+    reserved while the quote is active.
+    """
+
+    id: int
+    market_slug: str
+    market_condition_id: str
+    outcome: str
+    token_id: str
+    size: float
+    half_spread_c: float
+    max_spread_c: float
+    min_size: float
+    daily_rate: float
+    tick: float
+    committed_capital: float
+    accrued_rewards: float
+    realized_bleed: float
+    fills: int
+    status: str  # "active" or "cancelled"
+    last_mid: float
+    created_at: str
+    last_accrued_at: str
+
+
+def create_maker_quote(
+    conn: sqlite3.Connection,
+    *,
+    market_slug: str,
+    market_condition_id: str,
+    outcome: str,
+    token_id: str,
+    size: float,
+    half_spread_c: float,
+    max_spread_c: float,
+    min_size: float,
+    daily_rate: float,
+    tick: float,
+    committed_capital: float,
+    last_mid: float,
+    last_accrued_at: str,
+) -> MakerQuote:
+    """Create a new active maker quote and return it."""
+    cursor = conn.execute(
+        """\
+        INSERT INTO maker_quotes (
+            market_slug, market_condition_id, outcome, token_id,
+            size, half_spread_c, max_spread_c, min_size, daily_rate, tick,
+            committed_capital, last_mid, last_accrued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            market_slug, market_condition_id, outcome, token_id,
+            size, half_spread_c, max_spread_c, min_size, daily_rate, tick,
+            committed_capital, last_mid, last_accrued_at,
+        ),
+    )
+    conn.commit()
+    return _get_maker_quote(conn, cursor.lastrowid)
+
+
+def get_maker_quote(conn: sqlite3.Connection, quote_id: int) -> MakerQuote | None:
+    """Return a specific maker quote, or None."""
+    return _get_maker_quote(conn, quote_id)
+
+
+def get_active_maker_quotes(conn: sqlite3.Connection) -> list[MakerQuote]:
+    """Return all active (resting) maker quotes."""
+    rows = conn.execute(
+        "SELECT * FROM maker_quotes WHERE status = 'active' ORDER BY id"
+    ).fetchall()
+    return [_row_to_maker_quote(r) for r in rows]
+
+
+def get_all_maker_quotes(conn: sqlite3.Connection) -> list[MakerQuote]:
+    """Return all maker quotes (active and cancelled), for P&L accounting."""
+    rows = conn.execute("SELECT * FROM maker_quotes ORDER BY id").fetchall()
+    return [_row_to_maker_quote(r) for r in rows]
+
+
+def cancel_maker_quote(conn: sqlite3.Connection, quote_id: int) -> MakerQuote | None:
+    """Cancel an active maker quote. Returns the updated quote or None."""
+    quote = _get_maker_quote(conn, quote_id)
+    if quote is None or quote.status != "active":
+        return None
+    conn.execute(
+        "UPDATE maker_quotes SET status = 'cancelled' WHERE id = ?",
+        (quote_id,),
+    )
+    conn.commit()
+    return _get_maker_quote(conn, quote_id)
+
+
+def update_maker_quote_accrual(
+    conn: sqlite3.Connection,
+    quote_id: int,
+    *,
+    accrued_rewards: float,
+    realized_bleed: float,
+    fills: int,
+    last_mid: float,
+    last_accrued_at: str,
+) -> MakerQuote:
+    """Persist an accrual step's updated totals and bookkeeping timestamps."""
+    conn.execute(
+        """\
+        UPDATE maker_quotes SET
+            accrued_rewards = ?,
+            realized_bleed = ?,
+            fills = ?,
+            last_mid = ?,
+            last_accrued_at = ?
+        WHERE id = ?
+        """,
+        (accrued_rewards, realized_bleed, fills, last_mid, last_accrued_at, quote_id),
+    )
+    conn.commit()
+    return _get_maker_quote(conn, quote_id)
+
+
+def _get_maker_quote(conn: sqlite3.Connection, quote_id: int) -> MakerQuote | None:
+    row = conn.execute(
+        "SELECT * FROM maker_quotes WHERE id = ?", (quote_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_maker_quote(row)
+
+
+def _row_to_maker_quote(row: sqlite3.Row) -> MakerQuote:
+    return MakerQuote(
+        id=row["id"],
+        market_slug=row["market_slug"],
+        market_condition_id=row["market_condition_id"],
+        outcome=row["outcome"],
+        token_id=row["token_id"],
+        size=row["size"],
+        half_spread_c=row["half_spread_c"],
+        max_spread_c=row["max_spread_c"],
+        min_size=row["min_size"],
+        daily_rate=row["daily_rate"],
+        tick=row["tick"],
+        committed_capital=row["committed_capital"],
+        accrued_rewards=row["accrued_rewards"],
+        realized_bleed=row["realized_bleed"],
+        fills=row["fills"],
+        status=row["status"],
+        last_mid=row["last_mid"],
+        created_at=row["created_at"],
+        last_accrued_at=row["last_accrued_at"],
     )

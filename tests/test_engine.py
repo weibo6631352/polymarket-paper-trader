@@ -839,3 +839,246 @@ class TestOrderTypeValidation:
             initialized_engine.place_limit_order(
                 "btc", "yes", "buy", 100.0, 0.55, order_type="bad",
             )
+
+
+# ---------------------------------------------------------------------------
+# Maker quotes (liquidity-rewards two-sided quoting)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+T0 = datetime(2026, 6, 24, 0, 0, 0, tzinfo=timezone.utc)
+
+MAKER_POOL = {
+    "daily": 100.0, "max_spread": 4.0, "min_size": 50.0, "tick": 0.01,
+    "token": "tok_yes", "question": "Q?", "condition_id": "0xabc123",
+}
+
+# bids/asks 10c either side of a 0.50 mid → nothing inside a 4c band
+OUT_OF_BAND_BOOK = _make_book(bids=[(0.40, 1000)], asks=[(0.60, 1000)])
+# 1c either side of mid → competitors inside the band
+CONTESTED_BOOK = _make_book(bids=[(0.49, 100)], asks=[(0.51, 100)])
+
+
+def _mock_maker_api(engine, market=None, pool="default", book=None, mid=0.50):
+    """Patch the API surface used by maker-quote methods."""
+    m = market or SAMPLE_MARKET
+    engine.api.get_market = MagicMock(return_value=m)
+    cfg = dict(MAKER_POOL) if pool == "default" else pool
+    engine.api.get_reward_config = MagicMock(return_value=cfg)
+    engine.api.get_order_book = MagicMock(
+        return_value=book if book is not None else OUT_OF_BAND_BOOK
+    )
+    engine.api.get_midpoint = MagicMock(return_value=mid)
+
+
+class TestPlaceMakerQuote:
+    def test_place_reserves_capital(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        assert q["status"] == "active"
+        assert q["size"] == 50.0
+        assert q["half_spread_c"] == pytest.approx(1.0)  # one tick default
+        assert q["committed_capital"] == pytest.approx(49.0)
+        assert q["daily_rate"] == 100.0
+        assert q["last_mid"] == pytest.approx(0.50)
+        # cash dropped by committed capital
+        assert eng.get_account().cash == pytest.approx(10_000.0 - 49.0)
+
+    def test_place_custom_size_and_spread(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote(
+            "will-bitcoin-hit-100k", "yes", size=100.0, half_spread_cents=2.0, now=T0
+        )
+        assert q["size"] == 100.0
+        assert q["half_spread_c"] == pytest.approx(2.0)
+        assert q["committed_capital"] == pytest.approx(100.0 * (1 - 0.04))
+
+    def test_size_below_min_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "yes", size=40.0)
+
+    def test_spread_too_wide_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote(
+                "will-bitcoin-hit-100k", "yes", half_spread_cents=5.0
+            )
+
+    def test_spread_nonpositive_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote(
+                "will-bitcoin-hit-100k", "yes", half_spread_cents=0.0
+            )
+
+    def test_not_in_rewards_program_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng, pool=None)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "yes")
+
+    def test_closed_market_rejected(self, initialized_engine: Engine, closed_market):
+        eng = initialized_engine
+        _mock_maker_api(eng, market=closed_market)
+        with pytest.raises(MarketClosedError):
+            eng.place_maker_quote("will-eth-hit-5k", "yes")
+
+    def test_invalid_mid_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng, mid=0.0)
+        with pytest.raises(OrderRejectedError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "yes")
+
+    def test_insufficient_cash_rejected(self, engine: Engine):
+        engine.init_account(10.0)
+        _mock_maker_api(engine)
+        with pytest.raises(InsufficientBalanceError):
+            engine.place_maker_quote("will-bitcoin-hit-100k", "yes")
+
+    def test_invalid_outcome_rejected(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        with pytest.raises(InvalidOutcomeError):
+            eng.place_maker_quote("will-bitcoin-hit-100k", "maybe")
+
+    def test_requires_account(self, engine: Engine):
+        _mock_maker_api(engine)
+        with pytest.raises(NotInitializedError):
+            engine.place_maker_quote("will-bitcoin-hit-100k", "yes")
+
+
+class TestGetMakerQuotes:
+    def test_lists_active(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        quotes = eng.get_maker_quotes()
+        assert len(quotes) == 1
+        assert quotes[0]["status"] == "active"
+
+
+class TestCancelMakerQuote:
+    def test_cancel_releases_capital(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        assert eng.get_account().cash == pytest.approx(9951.0)
+        cancelled = eng.cancel_maker_quote(q["id"])
+        assert cancelled["status"] == "cancelled"
+        assert eng.get_account().cash == pytest.approx(10_000.0)
+        assert eng.get_maker_quotes() == []
+
+    def test_cancel_missing_none(self, initialized_engine: Engine):
+        assert initialized_engine.cancel_maker_quote(999) is None
+
+    def test_cancel_already_cancelled_none(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        q = eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.cancel_maker_quote(q["id"])
+        assert eng.cancel_maker_quote(q["id"]) is None
+
+
+class TestAccrueMakerRewards:
+    def test_empty_band_full_day_reward(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)  # out-of-band book → share 1.0
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        assert len(results) == 1
+        assert results[0]["share"] == pytest.approx(1.0)
+        assert results[0]["reward"] == pytest.approx(100.0)
+        assert results[0]["bleed"] == 0.0
+        # cash = 10000 - 49 committed + 100 reward
+        assert eng.get_account().cash == pytest.approx(10_051.0)
+
+    def test_contested_book_partial_share(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng, book=CONTESTED_BOOK)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        results = eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        # my qmin 28.125 / (28.125 + 56.25) = 1/3
+        assert results[0]["share"] == pytest.approx(1.0 / 3.0)
+        assert results[0]["reward"] == pytest.approx(100.0 / 3.0)
+
+    def test_adverse_bleed_on_jump(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        # mid jumps 5c with no elapsed time → pure bleed, no reward
+        eng.api.get_midpoint.return_value = 0.45
+        results = eng.accrue_maker_rewards(now=T0)
+        assert results[0]["reward"] == 0.0
+        assert results[0]["bleed"] == pytest.approx(2.0)  # 50 * (0.05 - 0.01)
+        assert results[0]["quote"]["fills"] == 1
+        assert eng.get_account().cash == pytest.approx(9951.0 - 2.0)
+
+    def test_transient_book_error_skipped(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.api.get_order_book = MagicMock(side_effect=Exception("down"))
+        assert eng.accrue_maker_rewards(now=T0 + timedelta(days=1)) == []
+        # no cash change
+        assert eng.get_account().cash == pytest.approx(9951.0)
+
+    def test_invalid_mid_skipped(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.api.get_midpoint.return_value = 0.0
+        assert eng.accrue_maker_rewards(now=T0 + timedelta(days=1)) == []
+
+    def test_no_active_quotes_empty(self, initialized_engine: Engine):
+        assert initialized_engine.accrue_maker_rewards(now=T0) == []
+
+    def test_clock_skew_no_negative_reward(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        # accrue with an earlier clock → seconds clamped to 0
+        results = eng.accrue_maker_rewards(now=T0 - timedelta(days=1))
+        assert results[0]["reward"] == 0.0
+
+
+class TestMakerSummaryAndBalance:
+    def test_summary_aggregates(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        s = eng.get_maker_summary()
+        assert s["active_quotes"] == 1
+        assert s["total_quotes"] == 1
+        assert s["committed_capital"] == pytest.approx(49.0)
+        assert s["reward_income"] == pytest.approx(100.0)
+        assert s["adverse_bleed"] == 0.0
+        assert s["net_maker_pnl"] == pytest.approx(100.0)
+
+    def test_balance_reflects_maker(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        eng.accrue_maker_rewards(now=T0 + timedelta(days=1))
+        bal = eng.get_balance()
+        assert bal["maker_committed_capital"] == pytest.approx(49.0)
+        assert bal["maker_reward_income"] == pytest.approx(100.0)
+        assert bal["maker_net_pnl"] == pytest.approx(100.0)
+        # total_value = cash(10051) + positions(0) + committed(49)
+        assert bal["total_value"] == pytest.approx(10_100.0)
+        assert bal["pnl"] == pytest.approx(100.0)
+
+    def test_snapshot_equity_includes_committed(self, initialized_engine: Engine):
+        eng = initialized_engine
+        _mock_maker_api(eng)
+        eng.place_maker_quote("will-bitcoin-hit-100k", "yes", now=T0)
+        equity = eng.snapshot_equity()
+        # cash 9951 + committed 49 = 10000 (no positions)
+        assert equity == pytest.approx(10_000.0)

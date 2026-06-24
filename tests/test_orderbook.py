@@ -10,7 +10,18 @@ from __future__ import annotations
 import pytest
 
 from pm_trader.models import OrderBook, OrderBookLevel
-from pm_trader.orderbook import calculate_fee, simulate_buy_fill, simulate_sell_fill
+from pm_trader.orderbook import (
+    _inband_weight,
+    adverse_bleed,
+    book_inband_qmin,
+    calculate_fee,
+    committed_capital,
+    maker_quote_score,
+    maker_reward_share,
+    reward_accrual,
+    simulate_buy_fill,
+    simulate_sell_fill,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -668,3 +679,119 @@ class TestDesignDocExample:
 
         expected_fee = (200 / 10_000) * min(result.avg_price, 1.0 - result.avg_price) * 100.0
         assert result.fee == pytest.approx(expected_fee)
+
+
+# ---------------------------------------------------------------------------
+# Liquidity-rewards maker simulation (pure math)
+# ---------------------------------------------------------------------------
+
+class TestInbandWeight:
+    def test_at_mid_full_weight(self) -> None:
+        assert _inband_weight(0.0, 4.0) == pytest.approx(1.0)
+
+    def test_partial_weight(self) -> None:
+        # 1c inside a 4c band → ((4-1)/4)^2 = 0.5625
+        assert _inband_weight(1.0, 4.0) == pytest.approx(0.5625)
+
+    def test_at_band_edge_zero(self) -> None:
+        assert _inband_weight(4.0, 4.0) == pytest.approx(0.0)
+
+    def test_out_of_band_zero(self) -> None:
+        assert _inband_weight(5.0, 4.0) == 0.0
+
+    def test_crossing_negative_zero(self) -> None:
+        assert _inband_weight(-1.0, 4.0) == 0.0
+
+    def test_zero_max_spread_zero(self) -> None:
+        assert _inband_weight(0.0, 0.0) == 0.0
+
+
+class TestBookInbandQmin:
+    def test_min_of_two_sides(self) -> None:
+        book = OrderBook(
+            bids=[OrderBookLevel(price=0.49, size=100.0)],
+            asks=[OrderBookLevel(price=0.51, size=300.0)],
+        )
+        # mid 0.50, both 1c in a 4c band → weight 0.5625
+        q = book_inband_qmin(book, 0.50, 4.0)
+        # bid score 100*0.5625=56.25, ask 300*0.5625=168.75 → min is the bid
+        assert q == pytest.approx(56.25)
+
+    def test_out_of_band_levels_excluded(self) -> None:
+        book = OrderBook(
+            bids=[OrderBookLevel(price=0.40, size=100.0)],  # 10c >> 4c band
+            asks=[OrderBookLevel(price=0.51, size=100.0)],
+        )
+        assert book_inband_qmin(book, 0.50, 4.0) == 0.0  # empty bid side
+
+    def test_empty_book_zero(self) -> None:
+        assert book_inband_qmin(OrderBook(), 0.50, 4.0) == 0.0
+
+
+class TestMakerQuoteScore:
+    def test_in_band(self) -> None:
+        # 50 shares, 1c in a 4c band → 50 * 0.5625
+        assert maker_quote_score(50.0, 1.0, 4.0) == pytest.approx(28.125)
+
+    def test_out_of_band_zero(self) -> None:
+        assert maker_quote_score(50.0, 5.0, 4.0) == 0.0
+
+
+class TestMakerRewardShare:
+    def test_empty_band_full_share(self) -> None:
+        assert maker_reward_share(50.0, 1.0, 4.0, 0.0) == pytest.approx(1.0)
+
+    def test_contested_partial(self) -> None:
+        s = maker_reward_share(50.0, 1.0, 4.0, 1000.0)
+        assert 0.0 < s < 1.0
+
+    def test_out_of_band_quote_zero(self) -> None:
+        # quote wider than band → own score 0 → share 0 even with empty book
+        assert maker_reward_share(50.0, 5.0, 4.0, 0.0) == 0.0
+
+
+class TestRewardAccrual:
+    def test_full_day(self) -> None:
+        # 50% share of a $100/day pool for a full day = $50
+        assert reward_accrual(0.5, 100.0, 86_400.0) == pytest.approx(50.0)
+
+    def test_partial_period(self) -> None:
+        # half the pool for half a day
+        assert reward_accrual(0.5, 100.0, 43_200.0) == pytest.approx(25.0)
+
+    def test_zero_share(self) -> None:
+        assert reward_accrual(0.0, 100.0, 86_400.0) == 0.0
+
+    def test_zero_daily(self) -> None:
+        assert reward_accrual(0.5, 0.0, 86_400.0) == 0.0
+
+    def test_zero_seconds(self) -> None:
+        assert reward_accrual(0.5, 100.0, 0.0) == 0.0
+
+    def test_negative_seconds(self) -> None:
+        assert reward_accrual(0.5, 100.0, -10.0) == 0.0
+
+
+class TestAdverseBleed:
+    def test_move_within_offset_no_bleed(self) -> None:
+        # offset 1c, mid moved 0.5c → harmless
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.505) == 0.0
+
+    def test_move_exactly_offset_no_bleed(self) -> None:
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.51) == pytest.approx(0.0)
+
+    def test_jump_beyond_offset_bleeds(self) -> None:
+        # offset 1c, mid jumped 5c down → excess 4c → 50 * 0.04 = 2.0
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.45) == pytest.approx(2.0)
+
+    def test_symmetric_up_move(self) -> None:
+        assert adverse_bleed(50.0, 1.0, 0.50, 0.55) == pytest.approx(2.0)
+
+
+class TestCommittedCapital:
+    def test_typical(self) -> None:
+        # 50 shares, 1c each side → 50 * (1 - 0.02) = 49.0
+        assert committed_capital(50.0, 1.0) == pytest.approx(49.0)
+
+    def test_wide_quote_clamped_to_zero(self) -> None:
+        assert committed_capital(50.0, 60.0) == 0.0

@@ -147,6 +147,64 @@ class TestReset:
 
         assert len(get_pending_orders(db.conn)) == 0
 
+    def test_init_account_clears_maker_quotes(self, db: Database) -> None:
+        from pm_trader.orders import (
+            create_maker_quote,
+            get_all_maker_quotes,
+            init_orders_schema,
+        )
+
+        init_orders_schema(db.conn)
+        db.init_account(200.0)
+        create_maker_quote(
+            db.conn,
+            market_slug="m",
+            market_condition_id="0x1",
+            outcome="yes",
+            token_id="tok",
+            size=50.0,
+            half_spread_c=1.0,
+            max_spread_c=4.0,
+            min_size=50.0,
+            daily_rate=100.0,
+            tick=0.01,
+            committed_capital=49.0,
+            last_mid=0.50,
+            last_accrued_at="2026-06-24T00:00:00+00:00",
+        )
+        assert len(get_all_maker_quotes(db.conn)) == 1
+
+        db.init_account(200.0)  # re-init must clear maker quotes
+        assert len(get_all_maker_quotes(db.conn)) == 0
+
+    def test_reset_drops_maker_quotes(self, db: Database) -> None:
+        from pm_trader.orders import (
+            create_maker_quote,
+            get_all_maker_quotes,
+            init_orders_schema,
+        )
+
+        init_orders_schema(db.conn)
+        create_maker_quote(
+            db.conn,
+            market_slug="m",
+            market_condition_id="0x1",
+            outcome="yes",
+            token_id="tok",
+            size=50.0,
+            half_spread_c=1.0,
+            max_spread_c=4.0,
+            min_size=50.0,
+            daily_rate=100.0,
+            tick=0.01,
+            committed_capital=49.0,
+            last_mid=0.50,
+            last_accrued_at="2026-06-24T00:00:00+00:00",
+        )
+        db.reset()
+        init_orders_schema(db.conn)
+        assert len(get_all_maker_quotes(db.conn)) == 0
+
 
 # ======================================================================
 # Trades

@@ -901,3 +901,44 @@ class TestGetEvent:
         )
         result = client.get_event("bad")
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# get_reward_config tests
+# ---------------------------------------------------------------------------
+
+class TestGetRewardConfig:
+    def test_returns_pool_config(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(
+            url=httpx.URL(CLOB_BASE + "/markets/0xabc123"),
+            json={
+                "condition_id": "0xabc123",
+                "question": "Q?",
+                "minimum_tick_size": 0.01,
+                "tokens": [{"token_id": "tok_yes"}],
+                "rewards": {
+                    "rates": [{"rewards_daily_rate": 100.0}],
+                    "max_spread": 4.5,
+                    "min_size": 50.0,
+                },
+            },
+        )
+        pool = client.get_reward_config("0xabc123")
+        assert pool["daily"] == 100.0
+        assert pool["max_spread"] == 4.5
+        assert pool["min_size"] == 50.0
+        assert pool["tick"] == 0.01
+
+    def test_no_rewards_returns_none(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(
+            url=httpx.URL(CLOB_BASE + "/markets/0xabc123"),
+            json={"condition_id": "0xabc123", "tokens": [{"token_id": "tok"}]},
+        )
+        assert client.get_reward_config("0xabc123") is None
+
+    def test_non_dict_returns_none(self, client: PolymarketClient, httpx_mock):
+        httpx_mock.add_response(
+            url=httpx.URL(CLOB_BASE + "/markets/0xabc123"),
+            json=[],
+        )
+        assert client.get_reward_config("0xabc123") is None

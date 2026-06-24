@@ -175,6 +175,112 @@ def simulate_buy_fill(
 
 
 # ---------------------------------------------------------------------------
+# Liquidity-rewards maker simulation (paper)
+# ---------------------------------------------------------------------------
+#
+# Polymarket pays a fixed daily USDC pool, from its own treasury, to resting
+# limit orders quoted within ``max_spread`` cents of the midpoint (two-sided,
+# size-weighted by ``((c - s) / c) ** 2`` where ``s`` is the order's distance
+# from mid in cents and ``c`` is ``max_spread``).  A maker's reward share is its
+# binding-side (lighter of bid/ask) score over the total in-band score.
+#
+# These pure functions mirror ``pm_trader.rewards``' scanner scoring on the
+# engine's ``OrderBook`` dataclass so resting maker quotes can (a) accrue a share
+# of the pool over their in-band uptime and (b) get adversely picked off when the
+# mid jumps through them.  Net maker P&L = reward accrual − adverse bleed; the
+# validated edge (see lp-rewards-edge) is that low-catalyst mid-tail pools net
+# positive while deep marquee pools are a kill (one jump wipes weeks of reward).
+
+
+def _inband_weight(s_cents: float, max_spread_c: float) -> float:
+    """PM size-weight ``((c - s) / c) ** 2`` for an order ``s`` cents from mid.
+
+    Returns 0 when the order is outside the band (``s < 0`` means it crosses the
+    mid, ``s > c`` means it is too wide) or when ``max_spread_c <= 0``.
+    """
+    if max_spread_c <= 0:
+        return 0.0
+    if s_cents < -1e-9 or s_cents > max_spread_c + 1e-9:
+        return 0.0
+    return ((max_spread_c - s_cents) / max_spread_c) ** 2
+
+
+def book_inband_qmin(book: OrderBook, mid: float, max_spread_c: float) -> float:
+    """Binding-side (min of bid/ask) in-band reward score of the live book.
+
+    Sums each side's ``size * weight`` over the levels within ``max_spread_c`` of
+    ``mid``, then returns the lighter side — the competing makers' Qmin, used as
+    the denominator term when estimating our own reward share.
+    """
+    bid_score = sum(
+        lvl.size * _inband_weight((mid - lvl.price) * 100.0, max_spread_c)
+        for lvl in book.bids
+    )
+    ask_score = sum(
+        lvl.size * _inband_weight((lvl.price - mid) * 100.0, max_spread_c)
+        for lvl in book.asks
+    )
+    return min(bid_score, ask_score)
+
+
+def maker_quote_score(size: float, half_spread_c: float, max_spread_c: float) -> float:
+    """Binding-side reward score of our own two-sided quote.
+
+    Both sides rest ``half_spread_c`` cents from mid with ``size`` shares, so the
+    bid and ask scores are equal and the binding (min) score is just one side.
+    A quote wider than ``max_spread_c`` scores 0 (earns no reward).
+    """
+    return size * _inband_weight(half_spread_c, max_spread_c)
+
+
+def maker_reward_share(
+    size: float, half_spread_c: float, max_spread_c: float, existing_qmin: float
+) -> float:
+    """Our share of the daily pool ≈ ``our Qmin / (our Qmin + existing Qmin)``.
+
+    Returns 0 if our quote is out of band (score 0); returns 1 against an empty
+    in-band book (``existing_qmin == 0``).
+    """
+    mine = maker_quote_score(size, half_spread_c, max_spread_c)
+    denom = mine + existing_qmin
+    return (mine / denom) if denom > 0 else 0.0
+
+
+def reward_accrual(share: float, daily_rate: float, seconds: float) -> float:
+    """USDC reward for resting in-band for ``seconds`` at a given pool share."""
+    if share <= 0 or daily_rate <= 0 or seconds <= 0:
+        return 0.0
+    return share * daily_rate * (seconds / 86_400.0)
+
+
+def adverse_bleed(
+    size: float, half_spread_c: float, mid_prev: float, mid_now: float
+) -> float:
+    """Adverse-selection loss when the mid moves past a resting quote side.
+
+    A continuous maker re-centers each poll, so a move within ``half_spread_c``
+    of mid is harmless (the validated minute-level pick rate is ~0).  A larger
+    move fills the stale side at its quote price before the re-center, costing
+    ``size * (|move| - half_spread)`` — the portion of the move beyond the quoted
+    offset.  This is the discrete-jump bleed that kills deep marquee pools.
+    """
+    offset = half_spread_c / 100.0
+    excess = abs(mid_now - mid_prev) - offset
+    return size * excess if excess > 0 else 0.0
+
+
+def committed_capital(size: float, half_spread_c: float) -> float:
+    """Cash locked by a two-sided ``size`` quote (a YES bid + a NO bid).
+
+    bid notional + ask notional = ``size*(mid - s) + size*(1 - mid - s)``
+    ``= size * (1 - 2s)`` — independent of mid (``s`` in price units).  Clamped
+    to 0 for degenerate quotes wider than 50c per side.
+    """
+    cap = size * (1.0 - 2.0 * (half_spread_c / 100.0))
+    return cap if cap > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
 # Sell simulation — walk the BID side
 # ---------------------------------------------------------------------------
 

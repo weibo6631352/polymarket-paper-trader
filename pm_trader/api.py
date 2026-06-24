@@ -253,6 +253,23 @@ class PolymarketClient:
         self._set_cached(cache_key, {"minimum_tick_size": tick})
         return tick
 
+    def get_reward_config(self, condition_id: str) -> dict | None:
+        """Fetch a market's liquidity-reward config from the CLOB, or None.
+
+        Returns ``{daily, max_spread, min_size, tick, token, question,
+        condition_id}`` (see :func:`pm_trader.rewards.parse_rewards`) for a
+        market in the liquidity-rewards program, or ``None`` if it pays no
+        rewards.  Hits CLOB ``/markets/{condition_id}`` (which carries the
+        ``rewards`` block that the Gamma market response drops).  Never cached —
+        the daily rate and in-band config can change between epochs.
+        """
+        from pm_trader.rewards import parse_rewards
+
+        data = self._clob_get(f"/markets/{condition_id}")
+        if not isinstance(data, dict):
+            return None
+        return parse_rewards(data)
+
     # ------------------------------------------------------------------
     # Convenience: get everything needed for a trade
     # ------------------------------------------------------------------

@@ -120,9 +120,12 @@ class Database:
         self.conn.execute("DELETE FROM trades")
         self.conn.execute("DELETE FROM positions")
         self.conn.execute("DELETE FROM equity_curve")
-        # limit_orders is created lazily by orders.init_orders_schema; clear if present
+        # limit_orders / maker_quotes are created lazily by
+        # orders.init_orders_schema; clear them if present.
         if self._table_exists("limit_orders"):
             self.conn.execute("DELETE FROM limit_orders")
+        if self._table_exists("maker_quotes"):
+            self.conn.execute("DELETE FROM maker_quotes")
         self.conn.commit()
         return self.get_account()
 
@@ -163,6 +166,7 @@ class Database:
             DROP TABLE IF EXISTS account;
             DROP TABLE IF EXISTS market_cache;
             DROP TABLE IF EXISTS limit_orders;
+            DROP TABLE IF EXISTS maker_quotes;
             DROP TABLE IF EXISTS equity_curve;
             """
         )
