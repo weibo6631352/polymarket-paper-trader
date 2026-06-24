@@ -1,0 +1,32 @@
+........................................................................ [ 58%]
+...................................................                      [100%]
+123 passed in 0.13s
+
+[1/4] Unit suite (reward math + strategy logic) ...
+  -> PASS
+
+[2/4] Live reward-pool scan (real CLOB) ...
+  reward pools: 1000 | scored: 14 | SAFE(non-empty): 3
+    SAFE $   206/d share~0.01 jump<13.0c  Will Benjamin Netanyahu be the next Prime 
+    SAFE $  2381/d share~0.00 jump<2.5c  Will Argentina win the 2026 FIFA World Cup
+    SAFE $   416/d share~0.00 jump<3.0c  Will JD Vance win the 2028 US Presidential
+
+[3/4] Backtest with colocation lever (real history, live-measured share) ...
+  pools simulated: 12 (per-pool share measured from live books)
+    cancel_eff  0.0: reward $  3566.13 bleed $ 1726.88 NET $  1839.26
+    cancel_eff  0.9: reward $  3566.13 bleed $  172.69 NET $  3393.44
+
+[4/4] Portfolio: select a fundable $200 SAFE book (dry-run, no orders) ...
+  selected 6 pools | committed $196.36 | est reward $10.67/day | ~1,983%/yr
+    $   100/d share~0.02 cap $ 20.0  Will Trump meet with iShowSpeed in 2026?
+    $   100/d share~0.06 cap $ 98.0  Clarity Act signed into law in 2026?
+    $   100/d share~0.01 cap $ 19.6  Will Trump meet with Changpeng Zhao in 2
+    $   100/d share~0.01 cap $ 19.6  Will Trump meet with Mohammed bin Salman
+    $   100/d share~0.01 cap $ 19.6  Will Trump meet with Vladimir Putin in 2
+    $   100/d share~0.00 cap $ 19.6  Will Trump meet with Nicolás Maduro in 2
+
+==== VERDICT ====
+Edge: Polymarket liquidity-rewards making in SAFE mid-tail pools.
+Mechanism: treasury-funded reward share > adverse-selection bleed; colocation shrinks the bleed term (see aggregate above).
+Real-money execution is hard-gated in pm_edge/live.py — this run placed NO orders.
+Status: VALIDATED (units green)
