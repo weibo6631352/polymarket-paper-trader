@@ -419,7 +419,14 @@ def stats(ctx: click.Context, card: bool, plain: bool, tweet: bool) -> None:
         trades = engine.get_history(limit=10_000)
         portfolio = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio)
-        result = compute_stats(trades, account, positions_value, equity_curve=engine.db.get_equity_curve())
+        maker = engine.get_maker_summary()
+        result = compute_stats(
+            trades, account, positions_value,
+            equity_curve=engine.db.get_equity_curve(),
+            reward_income=maker["reward_income"],
+            adverse_bleed=maker["adverse_bleed"],
+            committed_capital=maker["committed_capital"],
+        )
         if tweet or card or plain:
             from pm_trader.card import generate_card, generate_card_plain, generate_tweet
             account_name = ctx.obj["account"]
@@ -844,6 +851,148 @@ def orders_check(ctx: click.Context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Maker quotes (liquidity-rewards two-sided quoting)
+# ---------------------------------------------------------------------------
+
+@main.group()
+def maker() -> None:
+    """Place and manage reward-earning two-sided maker quotes."""
+    pass
+
+
+@maker.command("place")
+@click.argument("slug_or_id")
+@click.option("--outcome", default="yes", help="Outcome to quote (default yes).")
+@click.option("--size", type=float, default=None, help="Shares per side (default pool min_size).")
+@click.option(
+    "--half-spread", "half_spread_cents", type=float, default=None,
+    help="Cents either side of mid (default one tick in-band).",
+)
+@click.pass_context
+def maker_place(
+    ctx: click.Context, slug_or_id: str, outcome: str,
+    size: float | None, half_spread_cents: float | None,
+) -> None:
+    """Place a two-sided maker quote: pm-trader maker place SLUG"""
+    engine = _get_engine(ctx)
+    try:
+        result = engine.place_maker_quote(
+            slug_or_id, outcome, size=size, half_spread_cents=half_spread_cents,
+        )
+        click.echo(_ok(result))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("list")
+@click.pass_context
+def maker_list(ctx: click.Context) -> None:
+    """List active maker quotes."""
+    engine = _get_engine(ctx)
+    try:
+        click.echo(_ok(engine.get_maker_quotes()))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("cancel")
+@click.argument("quote_id", type=int)
+@click.pass_context
+def maker_cancel(ctx: click.Context, quote_id: int) -> None:
+    """Cancel an active maker quote and release its reserved capital."""
+    engine = _get_engine(ctx)
+    try:
+        result = engine.cancel_maker_quote(quote_id)
+        if result is None:
+            click.echo(json.dumps(
+                {"ok": False,
+                 "error": f"Maker quote {quote_id} not found or not active",
+                 "code": "QUOTE_NOT_FOUND"},
+                indent=2,
+            ))
+            sys.exit(1)
+        click.echo(_ok(result))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("accrue")
+@click.pass_context
+def maker_accrue(ctx: click.Context) -> None:
+    """Accrue rewards and apply adverse bleed for all active quotes."""
+    engine = _get_engine(ctx)
+    try:
+        click.echo(_ok(engine.accrue_maker_rewards()))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("status")
+@click.pass_context
+def maker_status(ctx: click.Context) -> None:
+    """Show aggregate maker P&L (committed capital, reward income, bleed, net)."""
+    engine = _get_engine(ctx)
+    try:
+        click.echo(_ok(engine.get_maker_summary()))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+@maker.command("plan")
+@click.argument("slug_or_id")
+@click.option("--outcome", default="yes")
+@click.pass_context
+def maker_plan(ctx: click.Context, slug_or_id: str, outcome: str) -> None:
+    """Dry-run: show the live two-sided quote orders a maker bot WOULD post.
+
+    Read-only — fetches the live book/mid and prints intended orders + estimated
+    reward share.  Submits nothing; real submission is hard-gated in maker_live.
+    """
+    from pm_trader.maker_live import LiveMakerBot
+
+    engine = _get_engine(ctx)
+    try:
+        market = engine.api.get_market(slug_or_id)
+        pool = engine.api.get_reward_config(market.condition_id)
+        if pool is None:
+            click.echo(json.dumps(
+                {"ok": False,
+                 "error": f"{market.slug} is not in the liquidity-rewards program",
+                 "code": "NOT_IN_PROGRAM"},
+                indent=2,
+            ))
+            sys.exit(1)
+        token_id = market.get_token_id(outcome.lower())
+        book = engine.api.get_order_book(token_id)
+        mid = engine.api.get_midpoint(token_id)
+        bot = LiveMakerBot(
+            token_id=token_id, max_spread_c=pool["max_spread"],
+            min_size=pool["min_size"], tick=pool["tick"], dry_run=True,
+        )
+        click.echo(_ok(bot.plan(book, mid)))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+    finally:
+        engine.close()
+
+
+# ---------------------------------------------------------------------------
 # Watch command
 # ---------------------------------------------------------------------------
 
@@ -869,6 +1018,76 @@ def watch(ctx: click.Context, slugs_or_ids: tuple[str, ...], outcomes: tuple[str
         sys.exit(1)
     finally:
         engine.close()
+
+
+# ---------------------------------------------------------------------------
+# Smart-money / copy-trading
+# ---------------------------------------------------------------------------
+
+
+@main.command("smart-money")
+@click.option("--windows", default="7d,30d,all", help="Comma list of 1d,7d,30d,all.")
+@click.option(
+    "--metric", type=click.Choice(["profit", "volume"]), default="profit"
+)
+@click.option("--top", "top_traders", type=int, default=15, help="Top N traders to scan.")
+@click.option("--position-limit", type=int, default=10, help="Positions per trader.")
+@click.option(
+    "--min-value", "min_position_value", type=float, default=500.0,
+    help="Ignore positions worth less than this (USD).",
+)
+def smart_money(
+    windows: str,
+    metric: str,
+    top_traders: int,
+    position_limit: int,
+    min_position_value: float,
+) -> None:
+    """Scan Polymarket's leaderboard for consistent traders' fresh positions."""
+    from pm_trader import smartmoney
+
+    try:
+        win = smartmoney.parse_windows(windows)
+        report = smartmoney.run_scan(
+            windows=win,
+            metric=metric,
+            top_traders=top_traders,
+            position_limit=position_limit,
+            min_position_value=min_position_value,
+        )
+        click.echo(_ok(report))
+    except ValueError as e:
+        click.echo(json.dumps(
+            {"ok": False, "error": str(e), "code": "VALUE_ERROR"}, indent=2,
+        ))
+        sys.exit(1)
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
+
+
+@main.command("rewards")
+@click.option(
+    "--min-daily", type=float, default=50.0,
+    help="Ignore reward pools below this daily rate (USD).",
+)
+@click.option("--top", type=int, default=30, help="Top N pools (by daily rate) to score.")
+@click.option(
+    "--no-jump-risk", is_flag=True, default=False,
+    help="Skip price-history jump-risk scoring (faster).",
+)
+def rewards(min_daily: float, top: int, no_jump_risk: bool) -> None:
+    """Scan Polymarket's liquidity-rewards pools, ranked by net yield potential."""
+    from pm_trader import rewards as rewards_mod
+
+    try:
+        report = rewards_mod.run_scan(
+            min_daily=min_daily, top=top, with_jump_risk=not no_jump_risk
+        )
+        click.echo(_ok(report))
+    except SimError as e:
+        click.echo(_err(e))
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

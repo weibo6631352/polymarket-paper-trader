@@ -11,3 +11,11 @@ build/
 .claude/projects/
 .claude/plans/
 .coverage
+
+# --- local agent config & secrets (迁移自 sports-trader-cpp,勿提交) ---
+.env
+.mcp.json
+.agents/
+.claude/skills/
+skills-lock.json
+CLAUDE.local.md

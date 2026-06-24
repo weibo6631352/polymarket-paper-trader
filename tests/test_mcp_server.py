@@ -32,11 +32,16 @@ from pm_trader.mcp_server import (
     init_account,
     leaderboard_card,
     leaderboard_entry,
+    accrue_maker_rewards,
+    cancel_maker_quote,
+    list_maker_quotes,
     list_markets,
     list_orders,
+    maker_status,
     pk_battle,
     pk_card,
     place_limit_order,
+    place_maker_quote,
     portfolio,
     reset_account,
     resolve,
@@ -1000,3 +1005,215 @@ class TestAccountValidation:
     def test_cancel_order_traversal(self):
         result = _parse(cancel_order(1, account="../evil"))
         assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Smart-money tools
+# ---------------------------------------------------------------------------
+
+
+class TestFindSmartMoney:
+    def test_success(self, monkeypatch):
+        from pm_trader import smartmoney
+
+        monkeypatch.setattr(
+            smartmoney, "run_scan",
+            lambda **k: {"candidate_count": 1, "candidates": [{"trader": "A"}]},
+        )
+        result = _parse(mcp_server.find_smart_money(windows="7d,30d"))
+        assert result["ok"] is True
+        assert result["data"]["candidate_count"] == 1
+
+    def test_invalid_window(self):
+        result = _parse(mcp_server.find_smart_money(windows="month"))
+        assert result["ok"] is False
+        assert "Invalid window" in result["error"]
+
+    def test_api_error_passes_through(self, monkeypatch):
+        from pm_trader import smartmoney
+        from pm_trader.models import ApiError
+
+        def boom(**k):
+            raise ApiError("upstream 500", status_code=500)
+
+        monkeypatch.setattr(smartmoney, "run_scan", boom)
+        result = _parse(mcp_server.find_smart_money())
+        assert result["ok"] is False
+        assert result["code"] == "API_ERROR"
+
+
+class TestTraderPositions:
+    def test_success(self, monkeypatch):
+        from pm_trader import smartmoney
+
+        class FakeClient:
+            def value(self, w):
+                return 123.0
+
+            def positions(self, w, limit=20):
+                return [{"title": "T"}]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(smartmoney, "SmartMoneyClient", lambda: FakeClient())
+        result = _parse(mcp_server.trader_positions(wallet="0x" + "a" * 40))
+        assert result["ok"] is True
+        assert result["data"]["open_value"] == 123.0
+        assert result["data"]["positions"][0]["title"] == "T"
+
+    def test_bad_wallet(self):
+        result = _parse(mcp_server.trader_positions(wallet="bad"))
+        assert result["ok"] is False
+        assert "Invalid wallet" in result["error"]
+
+
+class TestFindRewardPools:
+    def test_success(self, monkeypatch):
+        from pm_trader import rewards
+
+        monkeypatch.setattr(
+            rewards, "run_scan",
+            lambda **k: {"pools_scored": 2, "safe_count": 1, "pools": [{"question": "Q"}]},
+        )
+        result = _parse(mcp_server.find_reward_pools(min_daily=100.0, top=5))
+        assert result["ok"] is True
+        assert result["data"]["pools_scored"] == 2
+
+    def test_api_error_passes_through(self, monkeypatch):
+        from pm_trader import rewards
+        from pm_trader.models import ApiError
+
+        def boom(**k):
+            raise ApiError("clob 500", status_code=500)
+
+        monkeypatch.setattr(rewards, "run_scan", boom)
+        result = _parse(mcp_server.find_reward_pools())
+        assert result["ok"] is False
+        assert result["code"] == "API_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Maker quote tools
+# ---------------------------------------------------------------------------
+
+MAKER_POOL = {
+    "daily": 100.0, "max_spread": 4.0, "min_size": 50.0, "tick": 0.01,
+    "token": "tok_yes", "question": "Q?", "condition_id": "0xabc123",
+}
+
+
+def _mock_maker_engine(engine, in_program=True):
+    _mock_engine_api(engine)
+    engine.api.get_reward_config = MagicMock(
+        return_value=dict(MAKER_POOL) if in_program else None
+    )
+
+
+class TestMakerTools:
+    def test_place_maker_quote(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        result = _parse(place_maker_quote("will-bitcoin-hit-100k"))
+        assert result["ok"] is True
+        assert result["data"]["status"] == "active"
+        assert result["data"]["committed_capital"] == pytest.approx(49.0)
+
+    def test_place_with_overrides(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        result = _parse(place_maker_quote(
+            "will-bitcoin-hit-100k", "yes", size=100.0, half_spread_cents=2.0
+        ))
+        assert result["ok"] is True
+        assert result["data"]["size"] == 100.0
+        assert result["data"]["half_spread_c"] == pytest.approx(2.0)
+
+    def test_place_not_in_program(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine(), in_program=False)
+        result = _parse(place_maker_quote("will-bitcoin-hit-100k"))
+        assert result["ok"] is False
+
+    def test_list_maker_quotes(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        place_maker_quote("will-bitcoin-hit-100k")
+        result = _parse(list_maker_quotes())
+        assert result["ok"] is True
+        assert len(result["data"]) == 1
+
+    def test_accrue_maker_rewards(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        place_maker_quote("will-bitcoin-hit-100k")
+        result = _parse(accrue_maker_rewards())
+        assert result["ok"] is True
+        assert len(result["data"]) == 1
+
+    def test_maker_status(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        place_maker_quote("will-bitcoin-hit-100k")
+        result = _parse(maker_status())
+        assert result["ok"] is True
+        assert result["data"]["committed_capital"] == pytest.approx(49.0)
+
+    def test_cancel_maker_quote(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        place_maker_quote("will-bitcoin-hit-100k")
+        result = _parse(cancel_maker_quote(1))
+        assert result["ok"] is True
+        assert result["data"]["status"] == "cancelled"
+
+    def test_cancel_maker_quote_not_found(self):
+        init_account()
+        result = _parse(cancel_maker_quote(999))
+        assert result["ok"] is False
+        assert result["code"] == "not_found"
+
+    def test_stats_includes_maker_fields(self):
+        init_account()
+        from pm_trader.mcp_server import _get_engine
+        _mock_maker_engine(_get_engine())
+        place_maker_quote("will-bitcoin-hit-100k")
+        result = _parse(stats())
+        assert result["ok"] is True
+        assert result["data"]["committed_capital"] == pytest.approx(49.0)
+        assert result["data"]["reward_income"] == 0.0
+
+    def test_list_maker_quotes_not_initialized(self):
+        result = _parse(list_maker_quotes())
+        assert result["ok"] is False
+
+    def test_accrue_maker_rewards_not_initialized(self):
+        result = _parse(accrue_maker_rewards())
+        assert result["ok"] is False
+
+    def test_maker_status_not_initialized(self):
+        result = _parse(maker_status())
+        assert result["ok"] is False
+
+    def test_cancel_maker_quote_not_initialized(self):
+        result = _parse(cancel_maker_quote(1))
+        assert result["ok"] is False
+
+    def test_list_not_initialized(self):
+        assert _parse(list_maker_quotes())["ok"] is False
+
+    def test_accrue_not_initialized(self):
+        assert _parse(accrue_maker_rewards())["ok"] is False
+
+    def test_status_not_initialized(self):
+        assert _parse(maker_status())["ok"] is False
+
+    def test_cancel_not_initialized(self):
+        assert _parse(cancel_maker_quote(1))["ok"] is False

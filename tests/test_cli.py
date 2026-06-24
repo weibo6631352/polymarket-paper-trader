@@ -644,6 +644,164 @@ class TestOrderCommands:
 
 
 # ---------------------------------------------------------------------------
+# Maker quote commands
+# ---------------------------------------------------------------------------
+
+MAKER_POOL = {
+    "daily": 100.0, "max_spread": 4.0, "min_size": 50.0, "tick": 0.01,
+    "token": "tok_yes", "question": "Q?", "condition_id": "0xabc123",
+}
+
+
+class TestMakerCommands:
+    def _setup(self, MockClient, in_program=True):
+        m = MockClient.return_value
+        m.get_market.return_value = SAMPLE_MARKET
+        m.get_reward_config.return_value = dict(MAKER_POOL) if in_program else None
+        m.get_order_book.return_value = SAMPLE_BOOK
+        m.get_midpoint.return_value = 0.65
+        return m
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_place(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        result = _invoke(
+            runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir
+        )
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["status"] == "active"
+        assert data["data"]["committed_capital"] == pytest.approx(49.0)
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_place_not_in_program(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient, in_program=False)
+        result = _invoke(
+            runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir
+        )
+        data = _parse(result)
+        assert data["ok"] is False
+        assert result.exit_code == 1
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_list(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        _invoke(runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir)
+        result = _invoke(runner, ["maker", "list"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert len(data["data"]) == 1
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_accrue(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        _invoke(runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir)
+        result = _invoke(runner, ["maker", "accrue"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert len(data["data"]) == 1
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_status(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        _invoke(runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir)
+        result = _invoke(runner, ["maker", "status"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["committed_capital"] == pytest.approx(49.0)
+        assert data["data"]["net_maker_pnl"] == 0.0
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_cancel(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        _invoke(runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir)
+        result = _invoke(runner, ["maker", "cancel", "1"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["status"] == "cancelled"
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_cancel_not_found(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        result = _invoke(runner, ["maker", "cancel", "999"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is False
+        assert data["code"] == "QUOTE_NOT_FOUND"
+
+    def test_maker_list_not_initialized(self, runner, data_dir):
+        result = _invoke(runner, ["maker", "list"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["ok"] is False
+
+    def test_maker_accrue_not_initialized(self, runner, data_dir):
+        result = _invoke(runner, ["maker", "accrue"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["ok"] is False
+
+    def test_maker_status_not_initialized(self, runner, data_dir):
+        result = _invoke(runner, ["maker", "status"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["ok"] is False
+
+    def test_maker_cancel_not_initialized(self, runner, data_dir):
+        result = _invoke(runner, ["maker", "cancel", "1"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["ok"] is False
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_plan(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        result = _invoke(runner, ["maker", "plan", "will-bitcoin-hit-100k"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["dry_run"] is True
+        assert len(data["data"]["orders"]) == 2
+        assert "est_reward_share" in data["data"]
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_plan_not_in_program(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient, in_program=False)
+        result = _invoke(runner, ["maker", "plan", "will-bitcoin-hit-100k"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is False
+        assert data["code"] == "NOT_IN_PROGRAM"
+        assert result.exit_code == 1
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_maker_plan_api_error(self, MockClient, runner, data_dir):
+        from pm_trader.models import ApiError
+        _invoke(runner, ["init"], data_dir)
+        m = self._setup(MockClient)
+        m.get_reward_config.side_effect = ApiError("clob down")
+        result = _invoke(runner, ["maker", "plan", "will-bitcoin-hit-100k"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is False
+        assert data["code"] == "API_ERROR"
+        assert result.exit_code == 1
+
+    @patch("pm_trader.engine.PolymarketClient")
+    def test_stats_includes_maker_fields(self, MockClient, runner, data_dir):
+        _invoke(runner, ["init"], data_dir)
+        self._setup(MockClient)
+        _invoke(runner, ["maker", "place", "will-bitcoin-hit-100k"], data_dir)
+        result = _invoke(runner, ["stats"], data_dir)
+        data = _parse(result)
+        assert data["ok"] is True
+        assert data["data"]["committed_capital"] == pytest.approx(49.0)
+        assert data["data"]["reward_income"] == 0.0
+        assert data["data"]["net_maker_pnl"] == 0.0
+
+
+# ---------------------------------------------------------------------------
 # Watch command
 # ---------------------------------------------------------------------------
 
@@ -1067,3 +1225,72 @@ class TestCliSimErrorPaths:
         """mcp command invokes the MCP server."""
         result = runner.invoke(main, ["mcp"])
         mock_mcp_main.assert_called_once()
+
+
+class TestSmartMoneyCommand:
+    def test_success(self, runner, data_dir, monkeypatch):
+        from pm_trader import smartmoney
+
+        monkeypatch.setattr(
+            smartmoney, "run_scan",
+            lambda **k: {"candidate_count": 2, "candidates": []},
+        )
+        result = _invoke(runner, ["smart-money", "--windows", "7d,30d"], data_dir)
+        assert result.exit_code == 0
+        assert _parse(result)["data"]["candidate_count"] == 2
+
+    def test_invalid_window(self, runner, data_dir):
+        result = _invoke(runner, ["smart-money", "--windows", "month"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["code"] == "VALUE_ERROR"
+
+    def test_api_error(self, runner, data_dir, monkeypatch):
+        from pm_trader import smartmoney
+        from pm_trader.models import ApiError
+
+        def boom(**k):
+            raise ApiError("down")
+
+        monkeypatch.setattr(smartmoney, "run_scan", boom)
+        result = _invoke(runner, ["smart-money"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["code"] == "API_ERROR"
+
+
+class TestRewardsCommand:
+    def test_success(self, runner, data_dir, monkeypatch):
+        from pm_trader import rewards
+
+        monkeypatch.setattr(
+            rewards, "run_scan",
+            lambda **k: {"pools_scored": 3, "safe_count": 1, "pools": []},
+        )
+        result = _invoke(runner, ["rewards", "--min-daily", "100", "--top", "5"], data_dir)
+        assert result.exit_code == 0
+        assert _parse(result)["data"]["pools_scored"] == 3
+
+    def test_no_jump_risk_flag(self, runner, data_dir, monkeypatch):
+        from pm_trader import rewards
+
+        captured = {}
+
+        def fake(**k):
+            captured.update(k)
+            return {"pools": []}
+
+        monkeypatch.setattr(rewards, "run_scan", fake)
+        result = _invoke(runner, ["rewards", "--no-jump-risk"], data_dir)
+        assert result.exit_code == 0
+        assert captured["with_jump_risk"] is False
+
+    def test_api_error(self, runner, data_dir, monkeypatch):
+        from pm_trader import rewards
+        from pm_trader.models import ApiError
+
+        def boom(**k):
+            raise ApiError("clob down")
+
+        monkeypatch.setattr(rewards, "run_scan", boom)
+        result = _invoke(runner, ["rewards"], data_dir)
+        assert result.exit_code == 1
+        assert _parse(result)["code"] == "API_ERROR"

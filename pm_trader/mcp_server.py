@@ -433,6 +433,92 @@ def check_orders(account: str = "default") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Maker quotes (liquidity-rewards two-sided quoting)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def place_maker_quote(
+    slug_or_id: str,
+    outcome: str = "yes",
+    size: float = 0.0,
+    half_spread_cents: float = 0.0,
+    account: str = "default",
+) -> str:
+    """Place a resting two-sided maker quote that earns liquidity rewards.
+
+    Polymarket pays a daily USDC pool to resting orders quoted within the pool's
+    ``max_spread`` of mid (two-sided, size-weighted).  This quote rests
+    ``half_spread_cents`` either side of the live mid with ``size`` shares per
+    side; pass 0 to default to the pool's ``min_size`` and one tick in-band (the
+    validated recipe).  The market must be in the liquidity-rewards program.
+    Reserves ``committed_capital`` out of cash until cancelled.  Call
+    ``accrue_maker_rewards`` periodically to bank rewards and apply adverse bleed.
+    """
+    try:
+        engine = _get_engine(account)
+        quote = engine.place_maker_quote(
+            slug_or_id,
+            outcome,
+            size=size if size > 0 else None,
+            half_spread_cents=half_spread_cents if half_spread_cents > 0 else None,
+        )
+        return _ok(quote)
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def list_maker_quotes(account: str = "default") -> str:
+    """List all active maker quotes with their accrued reward income and bleed."""
+    try:
+        engine = _get_engine(account)
+        return _ok(engine.get_maker_quotes())
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def cancel_maker_quote(quote_id: int, account: str = "default") -> str:
+    """Cancel an active maker quote by ID and release its reserved capital."""
+    try:
+        engine = _get_engine(account)
+        quote = engine.cancel_maker_quote(quote_id)
+        if quote is None:
+            return _err(
+                f"Maker quote {quote_id} not found or not active", "not_found"
+            )
+        return _ok(quote)
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def accrue_maker_rewards(account: str = "default") -> str:
+    """Advance all active maker quotes: accrue rewards, apply adverse bleed.
+
+    Call periodically (like check_orders).  Each quote earns a share of its
+    pool's daily rate for the elapsed in-band time, minus the adverse-selection
+    bleed if the mid moved past the quoted offset since the last call.
+    """
+    try:
+        engine = _get_engine(account)
+        return _ok(engine.accrue_maker_rewards())
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def maker_status(account: str = "default") -> str:
+    """Aggregate maker P&L: committed capital, reward income, bleed, net P&L."""
+    try:
+        engine = _get_engine(account)
+        return _ok(engine.get_maker_summary())
+    except Exception as e:
+        return _err_from(e)
+
+
+# ---------------------------------------------------------------------------
 # Analytics tools
 # ---------------------------------------------------------------------------
 
@@ -448,8 +534,15 @@ def stats(account: str = "default") -> str:
         trades = engine.db.get_trades(limit=10_000)
         portfolio_items = engine.get_portfolio()
         positions_value = sum(p["current_value"] for p in portfolio_items)
+        maker = engine.get_maker_summary()
 
-        result = compute_stats(trades, acct, positions_value, equity_curve=engine.db.get_equity_curve())
+        result = compute_stats(
+            trades, acct, positions_value,
+            equity_curve=engine.db.get_equity_curve(),
+            reward_income=maker["reward_income"],
+            adverse_bleed=maker["adverse_bleed"],
+            committed_capital=maker["committed_capital"],
+        )
         return _ok(result)
     except Exception as e:
         return _err_from(e)
@@ -789,6 +882,106 @@ def backtest(
             snapshots, strategy_fn, strategy_path, balance, spread, depth,
         )
         return _ok(asdict(result))
+    except Exception as e:
+        return _err_from(e)
+
+
+# ---------------------------------------------------------------------------
+# Smart-money / copy-trading tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def find_smart_money(
+    windows: str = "7d,30d,all",
+    metric: str = "profit",
+    top_traders: int = 15,
+    position_limit: int = 10,
+    min_position_value: float = 500.0,
+) -> str:
+    """Find consistently profitable Polymarket traders and their fresh, copyable
+    open positions.
+
+    Ranks REAL traders (Polymarket's public leaderboard) by cross-window
+    consistency — present in more time windows means skill over variance — then
+    surfaces each trader's open positions that still enter near the trader's own
+    average price ("fresh"/"underwater").  Positions that already ran up (edge
+    realized) or sit at near-resolved prices are filtered out.
+
+    Returns candidates for de-vig + Kelly evaluation; a leaderboard name alone is
+    not an edge.  windows: comma list of 1d,7d,30d,all.  metric: profit|volume.
+    """
+    try:
+        from pm_trader import smartmoney
+
+        win = smartmoney.parse_windows(windows)
+        report = smartmoney.run_scan(
+            windows=win,
+            metric=metric,
+            top_traders=top_traders,
+            position_limit=position_limit,
+            min_position_value=min_position_value,
+        )
+        return _ok(report)
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def trader_positions(wallet: str, limit: int = 20) -> str:
+    """Get one Polymarket trader's current open positions by wallet address.
+
+    Returns the trader's total open value plus each position's average entry,
+    current price, size, and unrealized P&L — for drilling into a candidate
+    surfaced by find_smart_money.
+    """
+    try:
+        from pm_trader import smartmoney
+
+        client = smartmoney.SmartMoneyClient()
+        try:
+            open_value = client.value(wallet)
+            positions = client.positions(wallet, limit=limit)
+        finally:
+            client.close()
+        return _ok(
+            {
+                "wallet": wallet,
+                "open_value": round(open_value, 2),
+                "positions": positions,
+            }
+        )
+    except Exception as e:
+        return _err_from(e)
+
+
+@mcp.tool()
+def find_reward_pools(
+    min_daily: float = 50.0,
+    top: int = 30,
+    with_jump_risk: bool = True,
+) -> str:
+    """Scan Polymarket's liquidity-rewards pools, ranked by net yield potential.
+
+    Polymarket pays a fixed daily USDC pool from its own treasury to resting
+    limit orders quoted within ``max_spread`` of midpoint (two-sided,
+    size-weighted).  This is a durable, non-zero-sum subsidy — it is NOT
+    arbitraged to zero like a mispricing.  For each pool this estimates the gross
+    reward yield of posting min_size two-sided one tick in-band, and flags
+    deferred-jump risk (a single historical price jump that wipes many days of
+    reward = a trap).  SAFE, realistic (non-empty-band) pools are ranked first.
+
+    Note: this surfaces pools only — it does NOT place orders.  Capturing the
+    edge requires continuous two-sided quoting, inventory management, and fast
+    cancels (CLOB signed orders), which the paper engine does not simulate.
+    """
+    try:
+        from pm_trader import rewards
+
+        report = rewards.run_scan(
+            min_daily=min_daily, top=top, with_jump_risk=with_jump_risk
+        )
+        return _ok(report)
     except Exception as e:
         return _err_from(e)
 
