@@ -277,9 +277,11 @@ def score_pool(pool: dict, book: dict, history: list[dict]) -> dict | None:
     return {
         "question": pool["question"],
         "condition_id": pool["condition_id"],
+        "token": pool["token"],
         "daily": round(pool["daily"], 2),
         "max_spread_c": c,
         "min_size": pool["min_size"],
+        "tick": pool["tick"],
         "mid": round(mid, 4),
         "spread_c": round((best_ask - best_bid) * 100, 2),
         "inband_notional": round(bnot + anot),

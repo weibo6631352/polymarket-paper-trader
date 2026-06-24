@@ -65,6 +65,52 @@ class TestSimulatePool:
             simulate_pool([0.5, 0.5], daily=100.0, share=0.05, tick=0.01,
                           min_size=50.0, dt_seconds=3600.0, cancel_efficiency=1.5)
 
+    def test_requote_downtime_reduces_reward(self):
+        # one pickoff (10c move) + downtime → less reward than no downtime
+        path = [0.50, 0.60, 0.60]
+        base = simulate_pool(path, daily=100.0, share=0.5, tick=0.01,
+                             min_size=50.0, dt_seconds=3600.0, cancel_efficiency=1.0)
+        down = simulate_pool(path, daily=100.0, share=0.5, tick=0.01,
+                             min_size=50.0, dt_seconds=3600.0, cancel_efficiency=1.0,
+                             requote_downtime_s=1800.0)
+        assert down["reward_income"] < base["reward_income"]
+
+    def test_downtime_capped_at_horizon(self):
+        # huge downtime can't drive reward below 0
+        path = [0.50, 0.60]
+        r = simulate_pool(path, daily=100.0, share=0.5, tick=0.01, min_size=50.0,
+                          dt_seconds=60.0, cancel_efficiency=1.0,
+                          requote_downtime_s=1e9)
+        assert r["reward_income"] == 0.0
+
+    def test_bad_downtime(self):
+        with pytest.raises(ValueError):
+            simulate_pool([0.5, 0.5], daily=100.0, share=0.05, tick=0.01,
+                          min_size=50.0, dt_seconds=3600.0, requote_downtime_s=-1.0)
+
+    def test_unwind_cost_reduces_net(self):
+        path = [0.50, 0.60]  # one pickoff
+        base = simulate_pool(path, daily=100.0, share=0.5, tick=0.01, min_size=50.0,
+                             dt_seconds=3600.0)
+        unwound = simulate_pool(path, daily=100.0, share=0.5, tick=0.01, min_size=50.0,
+                                dt_seconds=3600.0, unwind_cost_ticks=2.0)
+        # 2 ticks × 50 sh × $0.01 = $1.00 unwind on the single fill
+        assert unwound["unwind_cost"] == pytest.approx(1.0)
+        assert unwound["net"] == pytest.approx(base["net"] - 1.0)
+
+    def test_unwind_scales_with_cancel_efficiency(self):
+        path = [0.50, 0.60]
+        slow = simulate_pool(path, daily=100.0, share=0.5, tick=0.01, min_size=50.0,
+                             dt_seconds=3600.0, cancel_efficiency=0.0, unwind_cost_ticks=2.0)
+        fast = simulate_pool(path, daily=100.0, share=0.5, tick=0.01, min_size=50.0,
+                             dt_seconds=3600.0, cancel_efficiency=0.9, unwind_cost_ticks=2.0)
+        assert fast["unwind_cost"] == pytest.approx(slow["unwind_cost"] * 0.1)
+
+    def test_bad_unwind(self):
+        with pytest.raises(ValueError):
+            simulate_pool([0.5, 0.5], daily=100.0, share=0.05, tick=0.01,
+                          min_size=50.0, dt_seconds=3600.0, unwind_cost_ticks=-1.0)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -105,11 +151,17 @@ def _flat_hist(n=15, p=0.5, step=3600):
     return [{"t": i * step, "p": p} for i in range(n)]
 
 
+def _two_sided(bid=0.49, ask=0.51, size=1000):
+    return {"bids": [{"price": bid, "size": size}], "asks": [{"price": ask, "size": size}]}
+
+
 class FakeClient:
-    def __init__(self, markets, histories, errors=None):
+    def __init__(self, markets, histories, errors=None, books=None, book_errors=None):
         self.markets = markets
         self.histories = histories
         self.errors = errors or set()
+        self.books = books or {}
+        self.book_errors = book_errors or set()
         self.closed = False
 
     def sampling_markets(self):
@@ -120,8 +172,35 @@ class FakeClient:
             raise RuntimeError("boom")
         return self.histories.get(token, [])
 
+    def book(self, token):
+        if token in self.book_errors:
+            raise RuntimeError("book down")
+        return self.books.get(token, {})
+
     def close(self):
         self.closed = True
+
+
+class TestLivePoolShare:
+    def _pool(self, token="a"):
+        from pm_trader.rewards import parse_rewards
+        return parse_rewards(_market(token=token))
+
+    def test_measures_share(self):
+        from pm_trader.maker_sim import live_pool_share
+        fc = FakeClient([], {}, books={"a": _two_sided()})
+        s = live_pool_share(fc, self._pool("a"))
+        assert 0 < s < 1
+
+    def test_empty_book_none(self):
+        from pm_trader.maker_sim import live_pool_share
+        fc = FakeClient([], {}, books={"a": {"bids": [], "asks": []}})
+        assert live_pool_share(fc, self._pool("a")) is None
+
+    def test_book_error_none(self):
+        from pm_trader.maker_sim import live_pool_share
+        fc = FakeClient([], {}, book_errors={"a"})
+        assert live_pool_share(fc, self._pool("a")) is None
 
 
 class TestRunExperiment:
@@ -159,6 +238,38 @@ class TestRunExperiment:
         fc = FakeClient(markets, hist)
         rep = maker_sim.run_experiment(fc, min_daily=50.0, top=2)
         assert rep["pools_simulated"] == 2
+
+    def test_scanned_share_used(self):
+        markets = [_market(daily=100.0, token="a")]
+        fc = FakeClient(markets, {"a": _flat_hist(20)}, books={"a": _two_sided()})
+        rep = maker_sim.run_experiment(fc, min_daily=50.0, use_scanned_share=True)
+        # share measured from the (contested) book, not the 0.05 flat default
+        assert rep["pools"][0]["share_used"] != 0.05
+        assert rep["params"]["use_scanned_share"] is True
+
+    def test_flat_share_when_disabled(self):
+        markets = [_market(daily=100.0, token="a")]
+        fc = FakeClient(markets, {"a": _flat_hist(20)}, books={"a": _two_sided()})
+        rep = maker_sim.run_experiment(fc, min_daily=50.0, share=0.05,
+                                       use_scanned_share=False)
+        assert rep["pools"][0]["share_used"] == 0.05
+
+    def test_scanned_share_falls_back_on_empty_book(self):
+        markets = [_market(daily=100.0, token="a")]
+        fc = FakeClient(markets, {"a": _flat_hist(20)})  # no books → fallback
+        rep = maker_sim.run_experiment(fc, min_daily=50.0, share=0.05,
+                                       use_scanned_share=True)
+        assert rep["pools"][0]["share_used"] == 0.05
+
+    def test_unwind_cost_in_aggregate(self):
+        # jumpy path so there are pickoffs to incur unwind cost
+        markets = [_market(daily=100.0, token="a")]
+        path = [{"t": i * 3600, "p": 0.5 + 0.1 * (i % 2)} for i in range(20)]
+        fc = FakeClient(markets, {"a": path})
+        rep = maker_sim.run_experiment(fc, min_daily=50.0, use_scanned_share=False,
+                                       unwind_cost_ticks=2.0)
+        assert rep["params"]["unwind_cost_ticks"] == 2.0
+        assert rep["aggregate"]["eff_0.0"]["unwind_cost"] > 0
 
 
 def test_run_builds_and_closes(monkeypatch):

@@ -108,11 +108,12 @@ class TestLiveMakerBot:
         assert out["requote"] is False
         assert out["submitted"] == []
 
-    def test_big_move_cancels_and_reposts(self):
+    def test_move_within_band_cancels_and_reposts(self):
         bot = self._bot()
         bot.step(_book(), 0.50)
-        out = bot.step(_book(0.58, 0.60), 0.59)  # 9c move
+        out = bot.step(_book(0.52, 0.54), 0.53)  # 3c move: re-center, NOT a catalyst jump
         assert out["requote"] is True
+        assert out["halted"] is False
         actions = [s["action"] for s in out["submitted"]]
         assert actions == ["CANCEL_ALL", "PLACE", "PLACE"]
 
@@ -127,3 +128,50 @@ class TestLiveMakerBot:
         out = bot.step(_book(), 0.50)
         assert len(calls) == 2
         assert all(s["status"] == "FAKE" for s in out["submitted"])
+
+    def test_inventory_short_after_ask_lifted(self):
+        bot = self._bot(size=50.0)
+        bot.step(_book(), 0.50)                    # quotes bid 0.49 / ask 0.51
+        out = bot.step(_book(0.52, 0.54), 0.53)    # 3c: mid past our 0.51 ask → sold (no jump)
+        assert out["inventory"] == -50.0           # short
+        assert out["skew_ticks"] < 0               # skew up → buy back via the other side
+
+    def test_inventory_long_after_bid_hit(self):
+        bot = self._bot(size=50.0)
+        bot.step(_book(), 0.50)
+        out = bot.step(_book(0.46, 0.48), 0.47)    # 3c: mid past our 0.49 bid → bought (no jump)
+        assert out["inventory"] == 50.0            # long
+        assert out["skew_ticks"] > 0               # skew down → sell off via the other side
+
+    def test_skew_shifts_quotes_to_flatten(self):
+        # cap = one fill so a single fill maxes the skew (visible past tick rounding)
+        bot = self._bot(size=50.0, max_inventory=50.0)
+        bot.step(_book(), 0.50)
+        bot.step(_book(0.46, 0.48), 0.47)          # now long at the cap
+        plan = bot.plan(_book(0.46, 0.48), 0.47)   # long → quotes shift DOWN to sell
+        assert plan["orders"][1]["price"] < 0.48   # ask pulled below the unskewed 0.48
+
+    def test_inventory_clamped_at_cap(self):
+        bot = self._bot(size=50.0, max_inventory=50.0)  # cap = one fill
+        bot.step(_book(), 0.50)
+        for m in (0.53, 0.56, 0.59):               # 3c steps → ask lifted each time, no jump-halt
+            bot.step(_book(m - 0.01, m + 0.01), m)
+        assert bot.inventory == -50.0              # never exceeds the cap despite repeated lifts
+
+    def test_skew_zero_when_no_cap(self):
+        bot = self._bot(size=50.0, max_inventory=0.0)
+        bot.inventory = 100.0
+        assert bot._skew_ticks() == 0.0
+
+    def test_catalyst_jump_halts_and_exits(self):
+        bot = self._bot(size=50.0)
+        bot.step(_book(), 0.50)
+        out = bot.step(_book(0.56, 0.58), 0.57)    # 7c jump beyond the band → catalyst
+        assert out["halted"] is True
+        assert out["recommend"] == "exit_cooldown"
+        assert [s["action"] for s in out["submitted"]] == ["CANCEL_ALL"]  # exit, no repost
+        assert out["orders"] == []
+        # stays out on subsequent polls (cooldown), no further orders
+        out2 = bot.step(_book(0.60, 0.62), 0.61)
+        assert out2["halted"] is True
+        assert out2["submitted"] == []
